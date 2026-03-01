@@ -53,15 +53,16 @@ type AcmeChallenge string
 
 // These types are the available challenges
 const (
-	ChallengeTypeHTTP01    = AcmeChallenge("http-01")
-	ChallengeTypeDNS01     = AcmeChallenge("dns-01")
-	ChallengeTypeTLSALPN01 = AcmeChallenge("tls-alpn-01")
+	ChallengeTypeHTTP01       = AcmeChallenge("http-01")
+	ChallengeTypeDNS01        = AcmeChallenge("dns-01")
+	ChallengeTypeTLSALPN01    = AcmeChallenge("tls-alpn-01")
+	ChallengeTypeDNSAccount01 = AcmeChallenge("dns-account-01")
 )
 
 // IsValid tests whether the challenge is a known challenge
 func (c AcmeChallenge) IsValid() bool {
 	switch c {
-	case ChallengeTypeHTTP01, ChallengeTypeDNS01, ChallengeTypeTLSALPN01:
+	case ChallengeTypeHTTP01, ChallengeTypeDNS01, ChallengeTypeTLSALPN01, ChallengeTypeDNSAccount01:
 		return true
 	default:
 		return false
@@ -75,16 +76,11 @@ type OCSPStatus string
 const (
 	OCSPStatusGood    = OCSPStatus("good")
 	OCSPStatusRevoked = OCSPStatus("revoked")
-	// Not a real OCSP status. This is a placeholder we write before the
-	// actual precertificate is issued, to ensure we never return "good" before
-	// issuance succeeds, for BR compliance reasons.
-	OCSPStatusNotReady = OCSPStatus("wait")
 )
 
 var OCSPStatusToInt = map[OCSPStatus]int{
-	OCSPStatusGood:     ocsp.Good,
-	OCSPStatusRevoked:  ocsp.Revoked,
-	OCSPStatusNotReady: -1,
+	OCSPStatusGood:    ocsp.Good,
+	OCSPStatusRevoked: ocsp.Revoked,
 }
 
 // DNSPrefix is attached to DNS names in DNS challenges
@@ -98,7 +94,7 @@ type RawCertificateRequest struct {
 // to account keys.
 type Registration struct {
 	// Unique identifier
-	ID int64 `json:"id,omitempty"`
+	ID int64 `json:"-"`
 
 	// Account key to which the details are attached
 	Key *jose.JSONWebKey `json:"key"`
@@ -107,7 +103,7 @@ type Registration struct {
 	Contact *[]string `json:"contact,omitempty"`
 
 	// Agreement with terms of service
-	Agreement string `json:"agreement,omitempty"`
+	Agreement string `json:"-"`
 
 	// CreatedAt is the time the registration was created.
 	CreatedAt *time.Time `json:"createdAt,omitempty"`
@@ -127,7 +123,7 @@ type ValidationRecord struct {
 	Hostname          string       `json:"hostname,omitempty"`
 	Port              string       `json:"port,omitempty"`
 	AddressesResolved []netip.Addr `json:"addressesResolved,omitempty"`
-	AddressUsed       netip.Addr   `json:"addressUsed,omitempty"`
+	AddressUsed       netip.Addr   `json:"addressUsed"`
 
 	// AddressesTried contains a list of addresses tried before the `AddressUsed`.
 	// Presently this will only ever be one IP from `AddressesResolved` since the
@@ -228,7 +224,7 @@ func (ch Challenge) RecordsSane() bool {
 			(ch.ValidationRecord[0].AddressUsed == netip.Addr{}) || len(ch.ValidationRecord[0].AddressesResolved) == 0 {
 			return false
 		}
-	case ChallengeTypeDNS01:
+	case ChallengeTypeDNS01, ChallengeTypeDNSAccount01:
 		if len(ch.ValidationRecord) > 1 {
 			return false
 		}
@@ -281,7 +277,7 @@ type Authorization struct {
 	ID string `json:"-"`
 
 	// The identifier for which authorization is being given
-	Identifier identifier.ACMEIdentifier `json:"identifier,omitempty"`
+	Identifier identifier.ACMEIdentifier `json:"identifier"`
 
 	// The registration ID associated with the authorization
 	RegistrationID int64 `json:"-"`
@@ -415,9 +411,9 @@ type CertificateStatus struct {
 	LastExpirationNagSent time.Time `db:"lastExpirationNagSent"`
 
 	// NotAfter and IsExpired are convenience columns which allow expensive
-	// queries to quickly filter out certificates that we don't need to care about
-	// anymore. These are particularly useful for the expiration mailer and CRL
-	// updater. See https://github.com/letsencrypt/boulder/issues/1864.
+	// queries to quickly filter out certificates that we don't need to care
+	// about anymore. These are particularly useful for the CRL updater. See
+	// https://github.com/letsencrypt/boulder/issues/1864.
 	NotAfter  time.Time `db:"notAfter"`
 	IsExpired bool      `db:"isExpired"`
 
@@ -427,16 +423,6 @@ type CertificateStatus struct {
 	// the DB, but update the Go field name to be clear which type of ID this
 	// is.
 	IssuerNameID int64 `db:"issuerID"`
-}
-
-// FQDNSet contains the SHA256 hash of the lowercased, comma joined dNSNames
-// contained in a certificate.
-type FQDNSet struct {
-	ID      int64
-	SetHash []byte
-	Serial  string
-	Issued  time.Time
-	Expires time.Time
 }
 
 // SCTDERs is a convenience type
