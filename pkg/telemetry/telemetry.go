@@ -53,8 +53,16 @@ var (
 	CatalogOperationDuration metric.Float64Histogram
 	CatalogServersGauge      metric.Int64Gauge
 
+	// Working set operation metrics
+	WorkingSetOperationsCounter metric.Int64Counter
+	WorkingSetOperationDuration metric.Float64Histogram
+
 	// Tool discovery metrics
 	ToolsDiscovered metric.Int64Gauge
+
+	// ToolSchemaDialects tracks tool schemas whose JSON Schema dialect was
+	// translated to 2020-12, and those relayed as the server declared them.
+	ToolSchemaDialects metric.Int64Counter
 
 	// Prompt operation metrics
 	PromptGetCounter   metric.Int64Counter
@@ -76,6 +84,9 @@ var (
 	ResourceTemplateErrorCounter metric.Int64Counter
 	ResourceTemplatesDiscovered  metric.Int64Gauge
 	ListResourceTemplatesCounter metric.Int64Counter
+
+	// Profile template usage metrics
+	TemplateUsageCounter metric.Int64Counter
 )
 
 // Init initializes the telemetry package with global providers
@@ -109,7 +120,7 @@ func Init() {
 	}
 
 	ToolCallDuration, err = meter.Float64Histogram("mcp.tool.duration",
-		metric.WithDescription("Duration of tool call execution"),
+		metric.WithDescription("Duration of tool call handling, including validation and policy checks"),
 		metric.WithUnit("ms"))
 	if err != nil {
 		// Log error but don't fail
@@ -168,6 +179,16 @@ func Init() {
 		}
 	}
 
+	ToolSchemaDialects, err = meter.Int64Counter("mcp.tool.schema_dialects",
+		metric.WithDescription("Tool schemas by what the gateway did with the JSON Schema dialect they declared"),
+		metric.WithUnit("1"))
+	if err != nil {
+		// Log error but don't fail
+		if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Error creating tool schema translations counter: %v\n", err)
+		}
+	}
+
 	CatalogOperationsCounter, err = meter.Int64Counter("mcp.catalog.operations",
 		metric.WithDescription("Number of catalog operations"),
 		metric.WithUnit("1"))
@@ -195,6 +216,27 @@ func Init() {
 		// Log error but don't fail
 		if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
 			fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Error creating catalog servers gauge: %v\n", err)
+		}
+	}
+
+	// Initialize working set metrics (metric names use "profile" for consistency)
+	WorkingSetOperationsCounter, err = meter.Int64Counter("mcp.profile.operations",
+		metric.WithDescription("Number of profile operations"),
+		metric.WithUnit("1"))
+	if err != nil {
+		// Log error but don't fail
+		if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Error creating profile operations counter: %v\n", err)
+		}
+	}
+
+	WorkingSetOperationDuration, err = meter.Float64Histogram("mcp.profile.operation.duration",
+		metric.WithDescription("Duration of profile operations"),
+		metric.WithUnit("ms"))
+	if err != nil {
+		// Log error but don't fail
+		if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Error creating profile duration histogram: %v\n", err)
 		}
 	}
 
@@ -351,6 +393,17 @@ func Init() {
 		}
 	}
 
+	// Initialize profile template metrics
+	TemplateUsageCounter, err = meter.Int64Counter("mcp.template.usage",
+		metric.WithDescription("Number of profile template usages"),
+		metric.WithUnit("1"))
+	if err != nil {
+		// Log error but don't fail
+		if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Error creating template usage counter: %v\n", err)
+		}
+	}
+
 	if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
 		fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Metrics created successfully\n")
 	}
@@ -472,19 +525,25 @@ func StartInterceptorSpan(ctx context.Context, when, interceptorType string, att
 }
 
 // RecordGatewayStart records a gateway start event
-func RecordGatewayStart(ctx context.Context, transportMode string) {
+func RecordGatewayStart(ctx context.Context, transportMode string, workingSetID string) {
 	if GatewayStartCounter == nil {
 		return // Telemetry not initialized
 	}
 
 	if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
-		fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Gateway started with transport: %s\n", transportMode)
+		fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Gateway started with transport: %s, profile: %s\n", transportMode, workingSetID)
 	}
 
-	GatewayStartCounter.Add(ctx, 1,
-		metric.WithAttributes(
-			attribute.String("mcp.gateway.transport", transportMode),
-		))
+	attrs := []attribute.KeyValue{
+		attribute.String("mcp.gateway.transport", transportMode),
+	}
+
+	// Only add profile attribute if a profile ID is provided
+	if workingSetID != "" {
+		attrs = append(attrs, attribute.String("mcp.gateway.profile", workingSetID))
+	}
+
+	GatewayStartCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 func RecordInitialize(ctx context.Context, params *mcp.InitializeParams) {
@@ -581,6 +640,27 @@ func RecordCatalogServers(ctx context.Context, catalogName string, serverCount i
 		metric.WithAttributes(
 			attribute.String("mcp.catalog.name", catalogName),
 		))
+}
+
+// RecordWorkingSetOperation records a working set operation with duration
+func RecordWorkingSetOperation(ctx context.Context, operation string, workingSetID string, durationMs float64, success bool) {
+	if WorkingSetOperationsCounter == nil || WorkingSetOperationDuration == nil {
+		return // Telemetry not initialized
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("mcp.profile.operation", operation),
+		attribute.String("mcp.profile.id", workingSetID),
+		attribute.Bool("mcp.profile.success", success),
+	}
+
+	if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Profile operation: %s on %s, duration: %.2fms, success: %v\n",
+			operation, workingSetID, durationMs, success)
+	}
+
+	WorkingSetOperationsCounter.Add(ctx, 1, metric.WithAttributes(attrs...))
+	WorkingSetOperationDuration.Record(ctx, durationMs, metric.WithAttributes(attrs...))
 }
 
 // RecordPromptGet records a prompt get operation
@@ -854,5 +934,45 @@ func RecordResourceTemplateList(ctx context.Context, serverName string, template
 	ResourceTemplatesDiscovered.Record(ctx, int64(templateCount),
 		metric.WithAttributes(
 			attribute.String("mcp.server.origin", serverName),
+		))
+}
+
+// RecordTemplateUsage records a profile template usage event.
+// source indicates the entry point: "profile-create-flag" or "template-use".
+func RecordTemplateUsage(ctx context.Context, templateID string, source string) {
+	if TemplateUsageCounter == nil {
+		return // Telemetry not initialized
+	}
+
+	if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Template used: %s via %s\n", templateID, source)
+	}
+
+	TemplateUsageCounter.Add(ctx, 1,
+		metric.WithAttributes(
+			attribute.String("mcp.template.id", templateID),
+			attribute.String("mcp.template.source", source),
+		))
+}
+
+// RecordToolSchemaDialect records what the gateway did with one tool schema's
+// declared JSON Schema dialect. outcome is "translated" when the schema was
+// converted to 2020-12, or "relayed" when it was passed through as declared
+// because no faithful translation exists.
+func RecordToolSchemaDialect(ctx context.Context, serverName, field, outcome string) {
+	if ToolSchemaDialects == nil {
+		return // Telemetry not initialized
+	}
+
+	if os.Getenv("DOCKER_MCP_TELEMETRY_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[MCP-TELEMETRY] Tool schema dialect %s: %s of a tool from server %s\n",
+			outcome, field, serverName)
+	}
+
+	ToolSchemaDialects.Add(ctx, 1,
+		metric.WithAttributes(
+			attribute.String("mcp.server.origin", serverName),
+			attribute.String("mcp.tool.schema_field", field),
+			attribute.String("mcp.tool.schema_outcome", outcome),
 		))
 }

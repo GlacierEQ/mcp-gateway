@@ -30,7 +30,7 @@ func TestIntegrationWithoutProxy(t *testing.T) {
 	env := clearProxyEnv(os.Environ())
 
 	// Test catalog show command without proxy
-	out := runDockerMCPWithEnv(t, env, "catalog", "show", "docker-mcp", "--format=json")
+	out := runDockerMCPWithEnv(t, env, "catalog", "show", "mcp/docker-mcp-catalog:latest", "--format=json")
 
 	// Verify catalog content
 	assert.Contains(t, out, `"registry"`, "Catalog should contain registry section")
@@ -61,10 +61,10 @@ func TestIntegrationWithBadProxy(t *testing.T) {
 	)
 
 	// Test catalog show command with bad proxy - should fail
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "docker", "mcp", "catalog", "show", "docker-mcp", "--format=json")
+	cmd := exec.CommandContext(ctx, "docker", "mcp", "catalog", "show", "mcp/docker-mcp-catalog:latest", "--pull=always", "--format=json")
 	cmd.Env = env
 
 	err := cmd.Run()
@@ -96,7 +96,7 @@ func TestIntegrationWithGoodProxy(t *testing.T) {
 	)
 
 	// Test catalog show command with good proxy
-	out := runDockerMCPWithEnv(t, env, "catalog", "show", "docker-mcp", "--format=json")
+	out := runDockerMCPWithEnv(t, env, "catalog", "show", "mcp/docker-mcp-catalog:latest", "--format=json")
 
 	// Verify catalog content
 	assert.Contains(t, out, `"registry"`, "Catalog should contain registry section")
@@ -186,15 +186,15 @@ func waitForProxyReady(t *testing.T, proxyDir string) {
 		case <-ctx.Done():
 			t.Fatal("Proxy server did not become ready within timeout")
 		case <-ticker.C:
-			if isProxyReady(proxyDir) {
+			if isProxyReady(ctx, proxyDir) {
 				return
 			}
 		}
 	}
 }
 
-func isProxyReady(proxyDir string) bool {
-	cmd := exec.Command("docker", "compose", "ps", "--services", "--filter", "status=running")
+func isProxyReady(ctx context.Context, proxyDir string) bool {
+	cmd := exec.CommandContext(ctx, "docker", "compose", "ps", "--services", "--filter", "status=running")
 	cmd.Dir = proxyDir
 	out, err := cmd.Output()
 	if err != nil {

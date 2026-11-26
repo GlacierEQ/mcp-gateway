@@ -15,7 +15,11 @@ import (
 	"github.com/docker/mcp-gateway/pkg/catalog"
 	"github.com/docker/mcp-gateway/pkg/config"
 	"github.com/docker/mcp-gateway/pkg/docker"
+	"github.com/docker/mcp-gateway/pkg/log"
 	"github.com/docker/mcp-gateway/pkg/oci"
+	"github.com/docker/mcp-gateway/pkg/policy"
+	policycli "github.com/docker/mcp-gateway/pkg/policy/cli"
+	policycontext "github.com/docker/mcp-gateway/pkg/policy/context"
 )
 
 type Configurator interface {
@@ -28,10 +32,27 @@ type Configuration struct {
 	config      map[string]map[string]any
 	tools       config.ToolsConfig
 	secrets     map[string]string
+	// serverCatalogs maps server names to catalog identifiers.
+	serverCatalogs map[string]string
+	// serverSourceTypeOverrides maps server names to explicit source type identifiers.
+	serverSourceTypeOverrides map[string]string
+	// workingSet is the profile identifier for this configuration.
+	workingSet string
 }
 
 func (c *Configuration) ServerNames() []string {
 	return c.serverNames
+}
+
+// AddSecrets merges new secret URIs into the configuration.
+// This is used when dynamically adding servers via mcp-add
+func (c *Configuration) AddSecrets(secrets map[string]string) {
+	if c.secrets == nil {
+		c.secrets = make(map[string]string)
+	}
+	for name, uri := range secrets {
+		c.secrets[name] = uri
+	}
 }
 
 func (c *Configuration) DockerImages() []string {
@@ -42,7 +63,7 @@ func (c *Configuration) DockerImages() []string {
 
 		switch {
 		case !found:
-			log("MCP server not found:", serverName)
+			log.Log("MCP server not found:", serverName)
 		case serverConfig != nil && serverConfig.Spec.Image != "":
 			uniqueDockerImages[serverConfig.Spec.Image] = true
 		case tools != nil:
@@ -71,13 +92,21 @@ func (c *Configuration) Find(serverName string) (*catalog.ServerConfig, *map[str
 
 	// Is it an MCP Server?
 	if server.Image != "" || server.SSEEndpoint != "" || server.Remote.URL != "" {
+		// Scope secrets to only the keys declared by this server so that a
+		// compromised or malicious server cannot access another server's secrets.
+		scopedSecrets := make(map[string]string, len(server.Secrets))
+		for _, s := range server.Secrets {
+			if v, ok := c.secrets[s.Name]; ok {
+				scopedSecrets[s.Name] = v
+			}
+		}
 		return &catalog.ServerConfig{
 			Name: serverName,
 			Spec: server,
 			Config: map[string]any{
 				oci.CanonicalizeServerName(serverName): c.config[oci.CanonicalizeServerName(serverName)],
 			},
-			Secrets: c.secrets, // TODO: we could keep just the secrets for this server
+			Secrets: scopedSecrets,
 		}, nil, true
 	}
 
@@ -87,6 +116,188 @@ func (c *Configuration) Find(serverName string) (*catalog.ServerConfig, *map[str
 		byName[tool.Name] = tool
 	}
 	return nil, &byName, true
+}
+
+// FilterByPolicy removes servers and tools that are denied by the policy client.
+// It uses batch evaluation to minimize HTTP overhead.
+func (c *Configuration) FilterByPolicy(ctx context.Context, pc policy.Client) error {
+	if pc == nil {
+		return nil
+	}
+
+	// Metadata for mapping batch results back to servers/tools.
+	type serverMeta struct {
+		name  string
+		index int // Index in batch request.
+	}
+	type toolMeta struct {
+		serverName string
+		toolName   string
+		index      int // Index in batch request.
+	}
+
+	var requests []policy.Request
+	var serverMetas []serverMeta
+	var toolMetas []toolMeta
+
+	// Build batch request with all policy evaluations.
+	for _, name := range c.serverNames {
+		serverMetas = append(serverMetas, serverMeta{name: name, index: len(requests)})
+		requests = append(requests, c.policyRequest(name, "", policy.ActionLoad))
+
+		// Add tool policy requests for this server.
+		if tools, ok := c.tools.ServerTools[name]; ok {
+			for _, t := range tools {
+				toolMetas = append(toolMetas, toolMeta{
+					serverName: name,
+					toolName:   t,
+					index:      len(requests),
+				})
+				requests = append(requests, c.policyRequest(name, t, policy.ActionLoad))
+			}
+		}
+	}
+
+	if len(requests) == 0 {
+		return nil
+	}
+
+	// Evaluate all requests in a single batch call.
+	decisions, err := pc.EvaluateBatch(ctx, requests)
+	decisions, err = policycli.NormalizeBatchDecisions(requests, decisions, err)
+	for i, req := range requests {
+		event := buildAuditEvent(req, decisions[i], nil, nil)
+		submitAuditEvent(pc, event)
+	}
+	if err != nil {
+		log.Logf("batch policy check failed: %v (denying all)", err)
+		c.serverNames = nil
+		c.servers = make(map[string]catalog.Server)
+		c.config = make(map[string]map[string]any)
+		c.tools = config.ToolsConfig{ServerTools: make(map[string][]string)}
+		return nil
+	}
+
+	// Build set of allowed servers from batch results.
+	allowedServers := make(map[string]bool)
+	for _, sm := range serverMetas {
+		decision := decisions[sm.index]
+		if decision.Allowed && decision.Error == "" {
+			allowedServers[sm.name] = true
+			continue
+		}
+		if decision.Error != "" {
+			log.Logf("policy check failed for server %s: %s (denying)", sm.name, decision.Error)
+			continue
+		}
+		log.Logf("policy denied server %s: %s", sm.name, decision.Reason)
+	}
+
+	// Build set of allowed tools from batch results.
+	allowedTools := make(map[string]map[string]bool) // serverName -> toolName -> allowed
+	for _, tm := range toolMetas {
+		if !allowedServers[tm.serverName] {
+			continue // Server already denied.
+		}
+		if allowedTools[tm.serverName] == nil {
+			allowedTools[tm.serverName] = make(map[string]bool)
+		}
+		decision := decisions[tm.index]
+		if decision.Allowed && decision.Error == "" {
+			allowedTools[tm.serverName][tm.toolName] = true
+			continue
+		}
+		if decision.Error != "" {
+			log.Logf("policy check failed for tool %s/%s: %s (denying)",
+				tm.serverName, tm.toolName, decision.Error)
+			continue
+		}
+		log.Logf("policy denied tool %s/%s: %s",
+			tm.serverName, tm.toolName, decision.Reason)
+	}
+
+	// Apply filtering based on batch results.
+	// Start with all existing servers (to preserve catalog servers for mcp-find)
+	filteredServers := make(map[string]catalog.Server, len(c.servers))
+	for name, server := range c.servers {
+		filteredServers[name] = server
+	}
+
+	filteredServerNames := make([]string, 0, len(c.serverNames))
+	filteredConfig := make(map[string]map[string]any)
+	filteredTools := config.ToolsConfig{
+		ServerTools: make(map[string][]string),
+	}
+
+	for _, name := range c.serverNames {
+		if !allowedServers[name] {
+			// Remove denied enabled servers from the servers map
+			delete(filteredServers, name)
+			continue
+		}
+
+		server := c.servers[name]
+
+		// Filter tools for this server if any.
+		if tools, ok := c.tools.ServerTools[name]; ok {
+			// Preserve the entry even when empty (explicit "disable all tools" signal).
+			if _, exists := filteredTools.ServerTools[name]; !exists {
+				filteredTools.ServerTools[name] = []string{}
+			}
+			for _, t := range tools {
+				if allowedTools[name][t] {
+					filteredTools.ServerTools[name] = append(filteredTools.ServerTools[name], t)
+				}
+			}
+			// Also trim catalog.Tools slice if present.
+			if len(server.Tools) > 0 {
+				var kept []catalog.Tool
+				for _, tool := range server.Tools {
+					if allowedTools[name][tool.Name] {
+						kept = append(kept, tool)
+					}
+				}
+				server.Tools = kept
+			}
+		}
+
+		filteredServers[name] = server
+		filteredServerNames = append(filteredServerNames, name)
+		canon := oci.CanonicalizeServerName(name)
+		if cfg, ok := c.config[canon]; ok {
+			filteredConfig[canon] = cfg
+		}
+	}
+
+	c.serverNames = filteredServerNames
+	c.servers = filteredServers
+	c.config = filteredConfig
+	c.tools = filteredTools
+	// c.secrets unchanged
+	return nil
+}
+
+// policyRequest builds a policy request for the provided server/tool/action.
+func (c *Configuration) policyRequest(serverName, tool string, action policy.Action) policy.Request {
+	req := policy.Request{
+		Catalog:    c.serverCatalogs[serverName],
+		WorkingSet: c.workingSet,
+		Server:     serverName,
+		Tool:       tool,
+		Action:     action,
+	}
+
+	server, ok := c.servers[serverName]
+	if !ok {
+		return req
+	}
+
+	ctx := policycontext.Context{
+		Catalog:                  c.serverCatalogs[serverName],
+		WorkingSet:               c.workingSet,
+		ServerSourceTypeOverride: c.serverSourceTypeOverrides[serverName],
+	}
+	return policycontext.BuildRequest(ctx, serverName, server, tool, action)
 }
 
 type FileBasedConfiguration struct {
@@ -99,7 +310,6 @@ type FileBasedConfiguration struct {
 	OciRef             []string         // OCI references to fetch server definitions from
 	MCPRegistryServers []catalog.Server // Servers fetched from MCP registries
 	Watch              bool
-	Central            bool
 	McpOAuthDcrEnabled bool
 
 	docker docker.Client
@@ -175,7 +385,7 @@ func (c *FileBasedConfiguration) Read(ctx context.Context) (Configuration, chan 
 
 				configuration, err := c.readOnce(ctx)
 				if err != nil {
-					log("Error reading configuration:", err)
+					log.Log("Error reading configuration:", err)
 					continue
 				}
 
@@ -213,43 +423,46 @@ func (c *FileBasedConfiguration) Read(ctx context.Context) (Configuration, chan 
 
 func (c *FileBasedConfiguration) readOnce(ctx context.Context) (Configuration, error) {
 	start := time.Now()
-	log("- Reading configuration...")
+	log.Log("- Reading configuration...")
 
 	var serverNames []string
-	if !c.Central {
-		if len(c.ServerNames) > 0 {
-			serverNames = c.ServerNames
-		} else {
-			registryConfig, err := c.readRegistry(ctx)
-			if err != nil {
-				return Configuration{}, fmt.Errorf("reading registry: %w", err)
-			}
+	serverCatalogs := make(map[string]string)
+	serverSourceTypeOverrides := make(map[string]string)
+	if len(c.ServerNames) > 0 {
+		serverNames = c.ServerNames
+	} else {
+		registryConfig, err := c.readRegistry(ctx)
+		if err != nil {
+			return Configuration{}, fmt.Errorf("reading registry: %w", err)
+		}
 
-			serverNames = registryConfig.ServerNames()
+		serverNames = registryConfig.ServerNames()
+		for name, tile := range registryConfig.Servers {
+			if tile.Ref != "" {
+				serverCatalogs[name] = tile.Ref
+			}
+			// Registry indicates the server definition came from a catalog source.
+			serverSourceTypeOverrides[name] = "registry"
 		}
 	}
 
-	// check for docker.io self-contained servers
-	selfContainedCatalog, updatedServerNames, err := oci.SelfContainedCatalog(ctx, c.docker, serverNames)
-	if err != nil {
-		return Configuration{}, fmt.Errorf("reading oci server: %w", err)
-	}
-	serverNames = updatedServerNames
-
-	// read local caalog files
-	mcpCatalog, err := c.readCatalog(ctx)
+	// read local catalog files
+	mcpCatalog, catalogRefs, err := c.readCatalog(ctx)
 	if err != nil {
 		return Configuration{}, fmt.Errorf("reading catalog: %w", err)
 	}
-
-	// merge self-contained servers with local catalog
-	servers := mcpCatalog.Servers
-	for k, v := range selfContainedCatalog.Servers {
-		servers[k] = v
+	for name, catalogRef := range catalogRefs {
+		if _, exists := serverCatalogs[name]; !exists {
+			serverCatalogs[name] = catalogRef
+			// Registry indicates the server definition came from a catalog source.
+			serverSourceTypeOverrides[name] = "registry"
+		}
 	}
 
+	servers := mcpCatalog.Servers
+
 	// Read servers from OCI references if any are provided
-	ociServers, err := c.readServersFromOci(ctx)
+	ociServers, ociCatalogRefs, err := c.readServersFromOci(ctx)
 	if err != nil {
 		return Configuration{}, fmt.Errorf("reading servers from OCI: %w", err)
 	}
@@ -257,9 +470,14 @@ func (c *FileBasedConfiguration) readOnce(ctx context.Context) (Configuration, e
 	// Merge OCI servers into the main servers map and add to serverNames list
 	for serverName, server := range ociServers {
 		if _, exists := servers[serverName]; exists {
-			log(fmt.Sprintf("Warning: server '%s' from OCI reference overwrites server from catalog", serverName))
+			log.Log(fmt.Sprintf("Warning: server '%s' from OCI reference overwrites server from catalog", serverName))
 		}
 		servers[serverName] = server
+		if catalogRef := ociCatalogRefs[serverName]; catalogRef != "" {
+			serverCatalogs[serverName] = catalogRef
+			// Registry indicates the server definition came from a catalog source.
+			serverSourceTypeOverrides[serverName] = "registry"
+		}
 
 		// Add to serverNames list if not already present
 		found := false
@@ -312,11 +530,10 @@ func (c *FileBasedConfiguration) readOnce(ctx context.Context) (Configuration, e
 				serverNames = append(serverNames, serverName)
 			}
 
-			log(fmt.Sprintf("Added MCP registry server: %s (image: %s)", serverName, mcpServer.Image))
+			log.Log(fmt.Sprintf("Added MCP registry server: %s (image: %s)", serverName, mcpServer.Image))
 		}
 	}
 
-	// TODO(dga): Do we expect every server to have a config, in Central mode?
 	serversConfig, err := c.readConfig(ctx)
 	if err != nil {
 		return Configuration{}, fmt.Errorf("reading config: %w", err)
@@ -327,44 +544,81 @@ func (c *FileBasedConfiguration) readOnce(ctx context.Context) (Configuration, e
 		return Configuration{}, fmt.Errorf("reading tools: %w", err)
 	}
 
-	// TODO(dga): How do we know which secrets to read, in Central mode?
+	// Build se:// URIs for secrets using shared function
+	buildSecretsURIs := func() map[string]string {
+		configs := make([]ServerSecretConfig, 0, len(serverNames))
+		for _, serverName := range serverNames {
+			server := servers[serverName]
+			configs = append(configs, ServerSecretConfig{
+				Secrets: server.Secrets,
+				OAuth:   server.OAuth,
+			})
+		}
+		return BuildSecretsURIs(ctx, configs)
+	}
+
 	var secrets map[string]string
 	if c.SecretsPath == "docker-desktop" {
-		secrets, err = c.readDockerDesktopSecrets(ctx, servers, serverNames)
-		if err != nil {
-			return Configuration{}, fmt.Errorf("reading MCP Toolkit's secrets: %w", err)
-		}
+		// Pure Docker Desktop mode: use se:// URIs
+		secrets = buildSecretsURIs()
 	} else {
+		// Mixed or file-only mode: iterate through paths
 		// Unless SecretsPath is only `docker-desktop`, we don't fail if secrets can't be read.
-		// It's ok for the MCP tookit's to not be available (in Cloud Run, for example).
+		// It's ok for the MCP toolkit's to not be available (in Cloud Run, for example).
 		// It's ok for secrets .env file to not exist.
-		var err error
 		for secretPath := range strings.SplitSeq(c.SecretsPath, ":") {
 			if secretPath == "docker-desktop" {
-				secrets, err = c.readDockerDesktopSecrets(ctx, servers, serverNames)
-			} else {
-				secrets, err = c.readSecretsFromFile(ctx, secretPath)
+				secrets = buildSecretsURIs()
+				break
 			}
-
+			secrets, err = c.readSecretsFromFile(ctx, secretPath)
 			if err == nil {
 				break
 			}
 		}
 	}
 
-	log("- Configuration read in", time.Since(start))
+	log.Log("- Configuration read in", time.Since(start))
 	return Configuration{
-		serverNames: serverNames,
-		servers:     servers,
-		config:      serversConfig,
-		tools:       serverToolsConfig,
-		secrets:     secrets,
+		serverNames:               serverNames,
+		servers:                   servers,
+		config:                    serversConfig,
+		tools:                     serverToolsConfig,
+		secrets:                   secrets,
+		serverCatalogs:            serverCatalogs,
+		serverSourceTypeOverrides: serverSourceTypeOverrides,
+		workingSet:                "",
 	}, nil
 }
 
-func (c *FileBasedConfiguration) readCatalog(ctx context.Context) (catalog.Catalog, error) {
-	log("  - Reading catalog from", c.CatalogPath)
-	return catalog.ReadFrom(ctx, c.CatalogPath)
+func (c *FileBasedConfiguration) readCatalog(ctx context.Context) (catalog.Catalog, map[string]string, error) {
+	log.Log("  - Reading catalog from", c.CatalogPath)
+
+	mergedServers := map[string]catalog.Server{}
+	serverCatalogs := map[string]string{}
+
+	for _, catalogPath := range c.CatalogPath {
+		if catalogPath == "" {
+			continue
+		}
+		cat, name, _, err := catalog.ReadOne(ctx, catalogPath)
+		if err != nil {
+			return catalog.Catalog{}, nil, err
+		}
+		catalogID := name
+		if catalogID == "" {
+			catalogID = catalogPath
+		}
+		for key, server := range cat.Servers {
+			if _, exists := mergedServers[key]; exists {
+				log.Log(fmt.Sprintf("Warning: overlapping key '%s' found in catalog '%s', overwriting previous value", key, catalogPath))
+			}
+			mergedServers[key] = server
+			serverCatalogs[key] = catalogID
+		}
+	}
+
+	return catalog.Catalog{Servers: mergedServers}, serverCatalogs, nil
 }
 
 func (c *FileBasedConfiguration) readRegistry(ctx context.Context) (config.Registry, error) {
@@ -381,7 +635,7 @@ func (c *FileBasedConfiguration) readRegistry(ctx context.Context) (config.Regis
 			continue
 		}
 
-		log("  - Reading registry from", registryPath)
+		log.Log("  - Reading registry from", registryPath)
 		yaml, err := config.ReadConfigFile(ctx, c.docker, registryPath)
 		if err != nil {
 			return config.Registry{}, fmt.Errorf("reading registry file %s: %w", registryPath, err)
@@ -395,7 +649,7 @@ func (c *FileBasedConfiguration) readRegistry(ctx context.Context) (config.Regis
 		// Merge servers into the combined registry, checking for overlaps
 		for serverName, tile := range cfg.Servers {
 			if _, exists := mergedRegistry.Servers[serverName]; exists {
-				log(fmt.Sprintf("Warning: overlapping server '%s' found in registry '%s', overwriting previous value", serverName, registryPath))
+				log.Log(fmt.Sprintf("Warning: overlapping server '%s' found in registry '%s', overwriting previous value", serverName, registryPath))
 			}
 			mergedRegistry.Servers[serverName] = tile
 		}
@@ -416,7 +670,7 @@ func (c *FileBasedConfiguration) readConfig(ctx context.Context) (map[string]map
 			continue
 		}
 
-		log("  - Reading config from", configPath)
+		log.Log("  - Reading config from", configPath)
 		yaml, err := config.ReadConfigFile(ctx, c.docker, configPath)
 		if err != nil {
 			return nil, fmt.Errorf("reading config file %s: %w", configPath, err)
@@ -430,7 +684,7 @@ func (c *FileBasedConfiguration) readConfig(ctx context.Context) (map[string]map
 		// Merge configs into the combined config, checking for overlaps
 		for serverName, serverConfig := range cfg {
 			if _, exists := mergedConfig[serverName]; exists {
-				log(fmt.Sprintf("Warning: overlapping server config '%s' found in config file '%s', overwriting previous value", serverName, configPath))
+				log.Log(fmt.Sprintf("Warning: overlapping server config '%s' found in config file '%s', overwriting previous value", serverName, configPath))
 			}
 			mergedConfig[serverName] = serverConfig
 		}
@@ -453,7 +707,7 @@ func (c *FileBasedConfiguration) readToolsConfig(ctx context.Context) (config.To
 			continue
 		}
 
-		log("  - Reading tools from", toolsPath)
+		log.Log("  - Reading tools from", toolsPath)
 		yaml, err := config.ReadConfigFile(ctx, c.docker, toolsPath)
 		if err != nil {
 			return config.ToolsConfig{}, fmt.Errorf("reading tools file %s: %w", toolsPath, err)
@@ -467,49 +721,13 @@ func (c *FileBasedConfiguration) readToolsConfig(ctx context.Context) (config.To
 		// Merge tools into the combined tools, checking for overlaps
 		for serverName, serverTools := range toolsConfig.ServerTools {
 			if _, exists := mergedToolsConfig.ServerTools[serverName]; exists {
-				log(fmt.Sprintf("Warning: overlapping server tools '%s' found in tools file '%s', overwriting previous value", serverName, toolsPath))
+				log.Log(fmt.Sprintf("Warning: overlapping server tools '%s' found in tools file '%s', overwriting previous value", serverName, toolsPath))
 			}
 			mergedToolsConfig.ServerTools[serverName] = serverTools
 		}
 	}
 
 	return mergedToolsConfig, nil
-}
-
-func (c *FileBasedConfiguration) readDockerDesktopSecrets(ctx context.Context, servers map[string]catalog.Server, serverNames []string) (map[string]string, error) {
-	// Use a map to deduplicate secret names
-	uniqueSecretNames := make(map[string]struct{})
-
-	for _, serverName := range serverNames {
-		serverName := strings.TrimSpace(serverName)
-
-		serverSpec, ok := servers[serverName]
-		if !ok {
-			continue
-		}
-
-		for _, s := range serverSpec.Secrets {
-			uniqueSecretNames[s.Name] = struct{}{}
-		}
-	}
-
-	if len(uniqueSecretNames) == 0 {
-		return map[string]string{}, nil
-	}
-
-	// Convert map keys to slice
-	var secretNames []string
-	for name := range uniqueSecretNames {
-		secretNames = append(secretNames, name)
-	}
-
-	log("  - Reading secrets", secretNames)
-	secretsByName, err := c.docker.ReadSecrets(ctx, secretNames, true)
-	if err != nil {
-		return nil, fmt.Errorf("finding secrets %s: %w", secretNames, err)
-	}
-
-	return secretsByName, nil
 }
 
 func (c *FileBasedConfiguration) readSecretsFromFile(ctx context.Context, path string) (map[string]string, error) {
@@ -549,14 +767,15 @@ func (c *FileBasedConfiguration) readSecretsFromFile(ctx context.Context, path s
 }
 
 // readServersFromOci fetches and parses server definitions from OCI references
-func (c *FileBasedConfiguration) readServersFromOci(_ context.Context) (map[string]catalog.Server, error) {
+func (c *FileBasedConfiguration) readServersFromOci(_ context.Context) (map[string]catalog.Server, map[string]string, error) {
 	ociServers := make(map[string]catalog.Server)
+	ociCatalogs := make(map[string]string)
 
 	if len(c.OciRef) == 0 {
-		return ociServers, nil
+		return ociServers, ociCatalogs, nil
 	}
 
-	log("  - Reading servers from OCI references", c.OciRef)
+	log.Log("  - Reading servers from OCI references", c.OciRef)
 
 	for _, ociRef := range c.OciRef {
 		if ociRef == "" {
@@ -564,9 +783,9 @@ func (c *FileBasedConfiguration) readServersFromOci(_ context.Context) (map[stri
 		}
 
 		// Use the existing oci.ReadArtifact function to get the Catalog data
-		ociCatalog, err := oci.ReadArtifact(ociRef)
+		ociCatalog, err := oci.ReadArtifact[oci.Catalog](ociRef, oci.MCPServerArtifactType)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read OCI artifact %s: %w", ociRef, err)
+			return nil, nil, fmt.Errorf("failed to read OCI artifact %s: %w", ociRef, err)
 		}
 
 		// Process each server in the OCI catalog registry
@@ -584,12 +803,13 @@ func (c *FileBasedConfiguration) readServersFromOci(_ context.Context) (map[stri
 			}
 
 			if _, exists := ociServers[serverName]; exists {
-				log(fmt.Sprintf("Warning: overlapping server '%s' found in OCI reference '%s', overwriting previous value", serverName, ociRef))
+				log.Log(fmt.Sprintf("Warning: overlapping server '%s' found in OCI reference '%s', overwriting previous value", serverName, ociRef))
 			}
 			ociServers[serverName] = server
-			log(fmt.Sprintf("  - Added server '%s' from OCI reference %s", serverName, ociRef))
+			ociCatalogs[serverName] = ociRef
+			log.Log(fmt.Sprintf("  - Added server '%s' from OCI reference %s", serverName, ociRef))
 		}
 	}
 
-	return ociServers, nil
+	return ociServers, ociCatalogs, nil
 }

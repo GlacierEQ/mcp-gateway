@@ -43,7 +43,8 @@ func buildElicitImage(t *testing.T) {
 	}
 	dockerfilePath := filepath.Join("test", "servers", "elicit", "Dockerfile")
 
-	cmd := exec.Command("docker", "build", "-t", "elicit:latest", "-f", dockerfilePath, ".")
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, "docker", "build", "-t", "elicit:latest", "-f", dockerfilePath, ".")
 	cmd.Dir = projectRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -85,14 +86,13 @@ func TestIntegrationWithElicitation(t *testing.T) {
 	buildElicitImage(t)
 
 	dockerClient := createDockerClientForElicitation(t)
-	tmp := t.TempDir()
-	writeFile(t, tmp, "catalog.yaml", "name: docker-test\nregistry:\n  elicit:\n    longLived: true\n    image: elicit:latest")
+	catalogFile := writeTrustedCatalogFile(t, "catalog.yaml", "name: docker-test\nregistry:\n  elicit:\n    longLived: true\n    image: elicit:latest")
 
 	args := []string{
 		"mcp",
 		"gateway",
 		"run",
-		"--catalog=" + filepath.Join(tmp, "catalog.yaml"),
+		"--catalog=" + catalogFile,
 		"--servers=elicit",
 		"--long-lived",
 		"--verbose",

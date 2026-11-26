@@ -7,6 +7,12 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/docker/mcp-gateway/pkg/log"
+	"github.com/docker/mcp-gateway/pkg/policy"
+	policycli "github.com/docker/mcp-gateway/pkg/policy/cli"
+	"github.com/docker/mcp-gateway/pkg/prompts"
+	// "github.com/docker/mcp-gateway/pkg/prompts"
 )
 
 func (g *Gateway) reloadConfiguration(ctx context.Context, configuration Configuration, serverNames []string, clientConfig *clientConfig) error {
@@ -15,19 +21,30 @@ func (g *Gateway) reloadConfiguration(ctx context.Context, configuration Configu
 		serverNames = configuration.ServerNames()
 	}
 	if len(serverNames) == 0 {
-		log("- No server is enabled")
+		log.Log("- No server is enabled")
 	} else {
-		log("- Those servers are enabled:", strings.Join(serverNames, ", "))
+		log.Log("- Those servers are enabled:", strings.Join(serverNames, ", "))
 	}
 
 	// List all the available tools.
 	startList := time.Now()
-	log("- Listing MCP tools...")
-	capabilities, err := g.listCapabilities(ctx, configuration, serverNames, clientConfig)
+	log.Log("- Listing MCP tools...")
+	capabilities, err := g.listCapabilities(ctx, serverNames, clientConfig)
 	if err != nil {
 		return fmt.Errorf("listing resources: %w", err)
 	}
-	log(">", len(capabilities.Tools), "tools listed in", time.Since(startList))
+	capabilities = filterInvalidCapabilities(capabilities)
+	log.Log(">", len(capabilities.Tools), "tools listed in", time.Since(startList))
+
+	capabilities = g.filterToolCapabilitiesByPolicy(ctx, configuration, capabilities, "tool")
+	capabilities = g.filterPromptCapabilitiesByPolicy(ctx, configuration, capabilities)
+
+	if err := validateExternalToolNameCollisions(capabilities.Tools, nil); err != nil {
+		return err
+	}
+	if err := validateExternalCapabilityNameCollisions(capabilities, capabilityNameIndexes{}, g.DynamicTools); err != nil {
+		return err
+	}
 
 	// Update capabilities
 	// Clear existing capabilities per server and register new ones
@@ -52,8 +69,9 @@ func (g *Gateway) reloadConfiguration(ctx context.Context, configuration Configu
 		}
 	}
 
-	// Clear the tracking map - we'll rebuild it
+	// Clear the tracking maps - we'll rebuild them
 	g.serverCapabilities = make(map[string]*ServerCapabilities)
+	g.toolRegistrations = make(map[string]ToolRegistration)
 
 	// Add new capabilities and track them per server
 	for _, tool := range capabilities.Tools {
@@ -67,37 +85,88 @@ func (g *Gateway) reloadConfiguration(ctx context.Context, configuration Configu
 			g.serverCapabilities[tool.ServerName].ToolNames,
 			tool.Tool.Name,
 		)
+
+		// Track tool registration for mcp-exec
+		g.toolRegistrations[tool.Tool.Name] = tool
 	}
 
 	// Add internal tools when dynamic-tools feature is enabled
 	if g.DynamicTools {
-		log("- Adding internal tools (dynamic-tools feature enabled)")
+		log.Log("- Adding internal tools (dynamic-tools feature enabled)")
 
 		// Add mcp-find tool
-		mcpFindTool := g.createMcpFindTool(configuration)
+		var handler mcp.ToolHandler
+		if g.embeddingsClient != nil {
+			handler = embeddingStrategy(g)
+		} else {
+			handler = bm25Strategy(g)
+		}
+		log.Log("  > mcp-find: tool for finding MCP servers in the catalog")
+		mcpFindTool := g.createMcpFindTool(configuration, handler)
 		g.mcpServer.AddTool(mcpFindTool.Tool, mcpFindTool.Handler)
+		g.toolRegistrations[mcpFindTool.Tool.Name] = *mcpFindTool
 
 		// Add mcp-add tool
+		log.Log("  > mcp-add: tool for adding MCP servers to the registry")
 		mcpAddTool := g.createMcpAddTool(clientConfig)
 		g.mcpServer.AddTool(mcpAddTool.Tool, mcpAddTool.Handler)
+		g.toolRegistrations[mcpAddTool.Tool.Name] = *mcpAddTool
 
 		// Add mcp-remove tool
+		log.Log("  > mcp-remove: tool for removing MCP servers from the registry")
 		mcpRemoveTool := g.createMcpRemoveTool()
 		g.mcpServer.AddTool(mcpRemoveTool.Tool, mcpRemoveTool.Handler)
+		g.toolRegistrations[mcpRemoveTool.Tool.Name] = *mcpRemoveTool
 
-		// Add mcp-registry-import tool
-		mcpRegistryImportTool := g.createMcpRegistryImportTool(configuration, clientConfig)
-		g.mcpServer.AddTool(mcpRegistryImportTool.Tool, mcpRegistryImportTool.Handler)
+		// Add codemode
+		log.Log("  > code-mode: write code that calls other MCPs directly")
+		codeModeTool := g.createCodeModeTool(clientConfig)
+		g.mcpServer.AddTool(codeModeTool.Tool, codeModeTool.Handler)
+		g.toolRegistrations[codeModeTool.Tool.Name] = *codeModeTool
+
+		// Add mcp-exec tool
+		log.Log("  > mcp-exec: execute tools that exist in the current session")
+		mcpExecTool := g.createMcpExecTool()
+		g.mcpServer.AddTool(mcpExecTool.Tool, mcpExecTool.Handler)
+		g.toolRegistrations[mcpExecTool.Tool.Name] = *mcpExecTool
 
 		// Add mcp-config-set tool
+		log.Log("  > mcp-config-set: tool for setting configuration values for MCP servers")
 		mcpConfigSetTool := g.createMcpConfigSetTool(clientConfig)
 		g.mcpServer.AddTool(mcpConfigSetTool.Tool, mcpConfigSetTool.Handler)
+		g.toolRegistrations[mcpConfigSetTool.Tool.Name] = *mcpConfigSetTool
 
-		log("  > mcp-find: tool for finding MCP servers in the catalog")
-		log("  > mcp-add: tool for adding MCP servers to the registry")
-		log("  > mcp-remove: tool for removing MCP servers from the registry")
-		log("  > mcp-registry-import: tool for importing servers from MCP registry URLs")
-		log("  > mcp-config-set: tool for setting configuration values for MCP servers")
+		// Add profile tools only if profiles feature is enabled
+		if g.UseProfiles {
+			// Add mcp-create-profile tool
+			log.Log("  > mcp-create-profile: tool for creating or updating profiles with current gateway state")
+			mcpCreateProfileTool := g.createMcpCreateProfileTool(clientConfig)
+			g.mcpServer.AddTool(mcpCreateProfileTool.Tool, mcpCreateProfileTool.Handler)
+			g.toolRegistrations[mcpCreateProfileTool.Tool.Name] = *mcpCreateProfileTool
+
+			// Add mcp-activate-profile tool
+			log.Log("  > mcp-activate-profile: tool for activating saved profiles")
+			mcpActivateProfileTool := g.createMcpActivateProfileTool(clientConfig)
+			g.mcpServer.AddTool(mcpActivateProfileTool.Tool, mcpActivateProfileTool.Handler)
+			g.toolRegistrations[mcpActivateProfileTool.Tool.Name] = *mcpActivateProfileTool
+		}
+
+		// Add find-tools tool only if embeddings client is configured
+		if g.embeddingsClient != nil {
+			log.Log("  > find-tools: AI-powered tool recommendation based on task description")
+			findToolsTool := g.createFindToolsTool(clientConfig)
+			g.mcpServer.AddTool(findToolsTool.Tool, findToolsTool.Handler)
+			g.toolRegistrations[findToolsTool.Tool.Name] = *findToolsTool
+		}
+
+		// Add mcp-registry-import tool
+		// mcpRegistryImportTool := g.createMcpRegistryImportTool(configuration, clientConfig)
+		// g.mcpServer.AddTool(mcpRegistryImportTool.Tool, mcpRegistryImportTool.Handler)
+		// g.toolRegistrations[mcpRegistryImportTool.Tool.Name] = *mcpRegistryImportTool
+
+		// Add prompt
+		prompts.AddDiscoverPrompt(g.mcpServer)
+		log.Log("  > mcp-discover: prompt for learning about dynamic server management")
 	}
 
 	for _, prompt := range capabilities.Prompts {
@@ -182,48 +251,247 @@ func diffStringSlices(older, newer []string) (additions, removals []string) {
 	return additions, removals
 }
 
-func (g *Gateway) reloadServerConfiguration(ctx context.Context, serverName string, clientConfig *clientConfig) error {
+func (g *Gateway) filterToolCapabilitiesByPolicy(ctx context.Context, configuration Configuration, caps *Capabilities, logLabel string) *Capabilities {
+	if caps == nil {
+		return &Capabilities{}
+	}
+
+	toolAllowed := make([]bool, len(caps.Tools))
+	if g.policyClient != nil && len(caps.Tools) > 0 {
+		requests := make([]policy.Request, len(caps.Tools))
+		for i, tool := range caps.Tools {
+			requests[i] = configuration.policyRequest(
+				tool.ServerName, tool.Tool.Name, policy.ActionLoad,
+			)
+		}
+		decisions, err := g.policyClient.EvaluateBatch(ctx, requests)
+		decisions, err = policycli.NormalizeBatchDecisions(requests, decisions, err)
+		for i, req := range requests {
+			event := buildAuditEvent(req, decisions[i], nil, nil)
+			submitAuditEvent(g.policyClient, event)
+		}
+		if err != nil {
+			// Fail-closed: deny all tools on batch error.
+			log.Logf("batch policy check failed for %ss: %v (denying all)", logLabel, err)
+		} else {
+			for i, dec := range decisions {
+				if dec.Allowed && dec.Error == "" {
+					toolAllowed[i] = true
+					continue
+				}
+				tool := caps.Tools[i]
+				if dec.Error != "" {
+					log.Logf("policy check failed for %s %s/%s: %s (denying)",
+						logLabel, tool.ServerName, tool.Tool.Name, dec.Error)
+					continue
+				}
+				log.Logf("policy denied %s %s/%s: %s",
+					logLabel, tool.ServerName, tool.Tool.Name, dec.Reason)
+			}
+		}
+	} else {
+		// No policy client - allow all tools.
+		for i := range toolAllowed {
+			toolAllowed[i] = true
+		}
+	}
+
+	return filterCapabilitiesByAllowedTools(caps, toolAllowed)
+}
+
+func (g *Gateway) filterPromptCapabilitiesByPolicy(ctx context.Context, configuration Configuration, caps *Capabilities) *Capabilities {
+	if caps == nil {
+		return &Capabilities{}
+	}
+
+	promptAllowed := make([]bool, len(caps.Prompts))
+	if g.policyClient != nil && len(caps.Prompts) > 0 {
+		requests := make([]policy.Request, len(caps.Prompts))
+		for i, prompt := range caps.Prompts {
+			requests[i] = configuration.policyRequest(
+				prompt.ServerName, prompt.Prompt.Name, policy.ActionPrompt,
+			)
+		}
+		decisions, err := g.policyClient.EvaluateBatch(ctx, requests)
+		decisions, err = policycli.NormalizeBatchDecisions(requests, decisions, err)
+		for i, req := range requests {
+			event := buildAuditEvent(req, decisions[i], nil, nil)
+			submitAuditEvent(g.policyClient, event)
+		}
+		if err != nil {
+			log.Logf("batch policy check failed for prompts: %v (denying all)", err)
+		} else {
+			for i, dec := range decisions {
+				if dec.Allowed && dec.Error == "" {
+					promptAllowed[i] = true
+					continue
+				}
+				prompt := caps.Prompts[i]
+				if dec.Error != "" {
+					log.Logf("policy check failed for prompt %s/%s: %s (denying)",
+						prompt.ServerName, prompt.Prompt.Name, dec.Error)
+					continue
+				}
+				log.Logf("policy denied prompt %s/%s: %s",
+					prompt.ServerName, prompt.Prompt.Name, dec.Reason)
+			}
+		}
+	} else {
+		// No policy client - allow all prompts.
+		for i := range promptAllowed {
+			promptAllowed[i] = true
+		}
+	}
+
+	filtered := &Capabilities{
+		Tools:             caps.Tools,
+		Resources:         caps.Resources,
+		ResourceTemplates: caps.ResourceTemplates,
+	}
+	for i, prompt := range caps.Prompts {
+		if i < len(promptAllowed) && promptAllowed[i] {
+			filtered.Prompts = append(filtered.Prompts, prompt)
+		}
+	}
+	return filtered
+}
+
+// allCapabilities builds a ServerCapabilities struct from the available capabilities for a server.
+// This function expects g.capabilitiesMu to be locked by the caller.
+func (g *Gateway) allCapabilities(serverName string) *ServerCapabilities {
+	availableCaps := g.serverAvailableCapabilities[serverName]
+	if availableCaps == nil {
+		return &ServerCapabilities{}
+	}
+
+	newCaps := &ServerCapabilities{
+		ToolNames:            make([]string, 0, len(availableCaps.Tools)),
+		PromptNames:          make([]string, 0, len(availableCaps.Prompts)),
+		ResourceURIs:         make([]string, 0, len(availableCaps.Resources)),
+		ResourceTemplateURIs: make([]string, 0, len(availableCaps.ResourceTemplates)),
+	}
+
+	for _, tool := range availableCaps.Tools {
+		newCaps.ToolNames = append(newCaps.ToolNames, tool.Tool.Name)
+	}
+	for _, prompt := range availableCaps.Prompts {
+		newCaps.PromptNames = append(newCaps.PromptNames, prompt.Prompt.Name)
+	}
+	for _, resource := range availableCaps.Resources {
+		newCaps.ResourceURIs = append(newCaps.ResourceURIs, resource.Resource.URI)
+	}
+	for _, template := range availableCaps.ResourceTemplates {
+		newCaps.ResourceTemplateURIs = append(newCaps.ResourceTemplateURIs, template.ResourceTemplate.URITemplate)
+	}
+
+	return newCaps
+}
+
+func (g *Gateway) reloadServerCapabilities(ctx context.Context, serverName string, clientConfig *clientConfig) (*ServerCapabilities, error) {
 	// Find the server configuration in current config
 	serverConfig, _, found := g.configuration.Find(serverName)
 	if !found || serverConfig == nil {
-		return fmt.Errorf("server %s not found in configuration", serverName)
+		return nil, fmt.Errorf("server %s not found in configuration", serverName)
 	}
 
 	// Get current newServerCaps from the server (this reflects the server's current state after it notified us of changes)
-	newServerCaps, err := g.listCapabilities(ctx, g.configuration, []string{serverName}, clientConfig)
+	newServerCaps, err := g.listCapabilities(ctx, []string{serverName}, clientConfig)
 	if err != nil {
-		return fmt.Errorf("failed to list capabilities for %s: %w", serverName, err)
+		return nil, fmt.Errorf("failed to list capabilities for %s: %w", serverName, err)
 	}
+	newServerCaps = filterInvalidCapabilities(newServerCaps)
 
 	// Lock for reading/writing capability tracking
 	g.capabilitiesMu.Lock()
 	defer g.capabilitiesMu.Unlock()
 
-	// Get old capabilities for this server
+	// Save old capabilities before updating
 	oldCaps := g.serverCapabilities[serverName]
 	if oldCaps == nil {
 		oldCaps = &ServerCapabilities{}
 	}
 
-	// Build new capability name/URI lists
-	newCaps := &ServerCapabilities{
-		ToolNames:            make([]string, 0, len(newServerCaps.Tools)),
-		PromptNames:          make([]string, 0, len(newServerCaps.Prompts)),
-		ResourceURIs:         make([]string, 0, len(newServerCaps.Resources)),
-		ResourceTemplateURIs: make([]string, 0, len(newServerCaps.ResourceTemplates)),
+	allowedServerCaps := g.filterToolCapabilitiesByPolicy(ctx, g.configuration, newServerCaps, "dynamic tool")
+	allowedServerCaps = g.filterPromptCapabilitiesByPolicy(ctx, g.configuration, allowedServerCaps)
+
+	existingToolRegistrations := make(map[string]ToolRegistration, len(g.toolRegistrations))
+	for toolName, registration := range g.toolRegistrations {
+		if registration.ServerName == serverName {
+			continue
+		}
+		existingToolRegistrations[toolName] = registration
 	}
 
-	for _, tool := range newServerCaps.Tools {
-		newCaps.ToolNames = append(newCaps.ToolNames, tool.Tool.Name)
+	if err := validateExternalToolNameCollisions(allowedServerCaps.Tools, existingToolRegistrations); err != nil {
+		return nil, err
 	}
-	for _, prompt := range newServerCaps.Prompts {
-		newCaps.PromptNames = append(newCaps.PromptNames, prompt.Prompt.Name)
+	if err := validateExternalCapabilityNameCollisions(allowedServerCaps, g.registeredCapabilityNameIndexes(serverName), g.DynamicTools); err != nil {
+		return nil, err
 	}
-	for _, resource := range newServerCaps.Resources {
-		newCaps.ResourceURIs = append(newCaps.ResourceURIs, resource.Resource.URI)
+
+	// Store the policy-filtered capabilities. updateServerCapabilities reads
+	// from this map, so denied tools must not remain here.
+	g.serverAvailableCapabilities[serverName] = allowedServerCaps
+
+	// Update tool registrations for this server
+	// This happens regardless of activation so tools can be called via mcp-exec
+	if oldCaps != nil {
+		// Remove old tool registrations for this server
+		for _, toolName := range oldCaps.ToolNames {
+			delete(g.toolRegistrations, toolName)
+		}
 	}
-	for _, template := range newServerCaps.ResourceTemplates {
-		newCaps.ResourceTemplateURIs = append(newCaps.ResourceTemplateURIs, template.ResourceTemplate.URITemplate)
+
+	// Add new tool registrations from the server (with policy filtering).
+	for _, tool := range allowedServerCaps.Tools {
+		g.toolRegistrations[tool.Tool.Name] = tool
+	}
+
+	// Return old capabilities for the caller to use with updateServerCapabilities
+	// The caller should use g.allCapabilities(serverName) to get newCaps
+	// The filtered capabilities are now in g.serverAvailableCapabilities[serverName]
+	// g.serverCapabilities will be set by updateServerCapabilities after all updates succeed
+	return oldCaps, nil
+}
+
+// registeredCapabilityNameIndexes builds indexes for capabilities currently
+// registered in the MCP server. This function expects g.capabilitiesMu to be
+// locked by the caller.
+func (g *Gateway) registeredCapabilityNameIndexes(excludeServerName string) capabilityNameIndexes {
+	indexes := capabilityNameIndexes{
+		Prompts:           make(map[string]string),
+		Resources:         make(map[string]string),
+		ResourceTemplates: make(map[string]string),
+	}
+
+	for serverName, caps := range g.serverCapabilities {
+		if serverName == excludeServerName || caps == nil {
+			continue
+		}
+		for _, promptName := range caps.PromptNames {
+			indexes.Prompts[promptName] = serverName
+		}
+		for _, resourceURI := range caps.ResourceURIs {
+			indexes.Resources[resourceURI] = serverName
+		}
+		for _, resourceTemplateURI := range caps.ResourceTemplateURIs {
+			indexes.ResourceTemplates[resourceTemplateURI] = serverName
+		}
+	}
+
+	return indexes
+}
+
+// updateServerCapabilities updates g.mcpServer with capabilities from the server.
+// If toolFilter is non-nil, only tools in the filter will be added.
+// This function expects g.capabilitiesMu to be locked by the caller.
+//
+//nolint:unparam // toolFilter is designed for future use - selective tool activation
+func (g *Gateway) updateServerCapabilities(serverName string, oldCaps, newCaps *ServerCapabilities, toolFilter []string) error {
+	// Get the full capabilities from serverAvailableCapabilities
+	newServerCaps := g.serverAvailableCapabilities[serverName]
+	if newServerCaps == nil {
+		return fmt.Errorf("no available capabilities found for server %s", serverName)
 	}
 
 	// Determine what changed
@@ -232,35 +500,64 @@ func (g *Gateway) reloadServerConfiguration(ctx context.Context, serverName stri
 	addedResources, removedResources := diffStringSlices(oldCaps.ResourceURIs, newCaps.ResourceURIs)
 	addedTemplates, removedTemplates := diffStringSlices(oldCaps.ResourceTemplateURIs, newCaps.ResourceTemplateURIs)
 
+	// Early exit if nothing changed - prevents unnecessary updates and potential notification loops
+	if len(addedTools) == 0 && len(removedTools) == 0 &&
+		len(addedPrompts) == 0 && len(removedPrompts) == 0 &&
+		len(addedResources) == 0 && len(removedResources) == 0 &&
+		len(addedTemplates) == 0 && len(removedTemplates) == 0 {
+		log.Log("  - No capability changes detected for", serverName, "- skipping update")
+		return nil
+	}
+
+	if err := validateExternalCapabilityNameCollisions(newServerCaps, g.registeredCapabilityNameIndexes(serverName), g.DynamicTools); err != nil {
+		return err
+	}
+
 	// Remove old capabilities that are no longer present
 	if len(removedTools) > 0 {
 		g.mcpServer.RemoveTools(removedTools...)
-		log("  - Removed", len(removedTools), "tools for", serverName)
+		// Remove from tool registrations tracking
+		for _, toolName := range removedTools {
+			delete(g.toolRegistrations, toolName)
+		}
+		log.Log("  - Removed", len(removedTools), "tools for", serverName)
 	}
 
 	if len(removedPrompts) > 0 {
 		g.mcpServer.RemovePrompts(removedPrompts...)
-		log("  - Removed", len(removedPrompts), "prompts for", serverName)
+		log.Log("  - Removed", len(removedPrompts), "prompts for", serverName)
 	}
 
 	if len(removedResources) > 0 {
 		g.mcpServer.RemoveResources(removedResources...)
-		log("  - Removed", len(removedResources), "resources for", serverName)
+		log.Log("  - Removed", len(removedResources), "resources for", serverName)
 	}
 
 	if len(removedTemplates) > 0 {
 		g.mcpServer.RemoveResourceTemplates(removedTemplates...)
-		log("  - Removed", len(removedTemplates), "resource templates for", serverName)
+		log.Log("  - Removed", len(removedTemplates), "resource templates for", serverName)
+	}
+
+	// Build tool filter set if provided
+	var toolFilterSet map[string]bool
+	if toolFilter != nil {
+		toolFilterSet = stringSliceToSet(toolFilter)
 	}
 
 	// Add/update all capabilities from this server
+	toolsAdded := 0
 	for _, tool := range addedTools {
+		// If tool filter is provided, only add tools in the filter
+		if toolFilterSet != nil && !toolFilterSet[tool] {
+			continue
+		}
 		if registration, err := newServerCaps.getToolByName(tool); err == nil {
 			g.mcpServer.AddTool(registration.Tool, registration.Handler)
+			toolsAdded++
 		}
 	}
-	if len(addedTools) > 0 {
-		log("  - Added/updated", len(addedTools), "tools for", serverName)
+	if toolsAdded > 0 {
+		log.Log("  - Added/updated", toolsAdded, "tools for", serverName)
 	}
 
 	for _, prompt := range addedPrompts {
@@ -269,7 +566,7 @@ func (g *Gateway) reloadServerConfiguration(ctx context.Context, serverName stri
 		}
 	}
 	if len(addedPrompts) > 0 {
-		log("  - Added/updated", len(addedPrompts), "prompts for", serverName)
+		log.Log("  - Added/updated", len(addedPrompts), "prompts for", serverName)
 	}
 
 	for _, resource := range addedResources {
@@ -278,7 +575,7 @@ func (g *Gateway) reloadServerConfiguration(ctx context.Context, serverName stri
 		}
 	}
 	if len(addedResources) > 0 {
-		log("  - Added/updated", len(addedResources), "resources for", serverName)
+		log.Log("  - Added/updated", len(addedResources), "resources for", serverName)
 	}
 
 	for _, template := range addedTemplates {
@@ -287,10 +584,10 @@ func (g *Gateway) reloadServerConfiguration(ctx context.Context, serverName stri
 		}
 	}
 	if len(addedTemplates) > 0 {
-		log("  - Added/updated", len(addedTemplates), "resource templates for", serverName)
+		log.Log("  - Added/updated", len(addedTemplates), "resource templates for", serverName)
 	}
 
-	// Update tracking with new capabilities
+	// Update the stored capabilities now that all updates succeeded
 	g.serverCapabilities[serverName] = newCaps
 
 	return nil
@@ -316,26 +613,35 @@ func (g *Gateway) removeServerConfiguration(_ context.Context, serverName string
 	// Remove old capabilities that are no longer present
 	if len(oldCaps.ToolNames) > 0 {
 		g.mcpServer.RemoveTools(oldCaps.ToolNames...)
-		log("  - Removed", len(oldCaps.ToolNames), "tools for", serverName)
+		log.Log("  - Removed", len(oldCaps.ToolNames), "tools for", serverName)
+		for _, toolName := range oldCaps.ToolNames {
+			delete(g.toolRegistrations, toolName)
+		}
+	}
+	for toolName, registration := range g.toolRegistrations {
+		if registration.ServerName == serverName {
+			delete(g.toolRegistrations, toolName)
+		}
 	}
 
 	if len(oldCaps.PromptNames) > 0 {
 		g.mcpServer.RemovePrompts(oldCaps.PromptNames...)
-		log("  - Removed", len(oldCaps.PromptNames), "prompts for", serverName)
+		log.Log("  - Removed", len(oldCaps.PromptNames), "prompts for", serverName)
 	}
 
 	if len(oldCaps.ResourceURIs) > 0 {
 		g.mcpServer.RemoveResources(oldCaps.ResourceURIs...)
-		log("  - Removed", len(oldCaps.ResourceURIs), "resources for", serverName)
+		log.Log("  - Removed", len(oldCaps.ResourceURIs), "resources for", serverName)
 	}
 
 	if len(oldCaps.ResourceTemplateURIs) > 0 {
 		g.mcpServer.RemoveResourceTemplates(oldCaps.ResourceTemplateURIs...)
-		log("  - Removed", len(oldCaps.ResourceTemplateURIs), "resource templates for", serverName)
+		log.Log("  - Removed", len(oldCaps.ResourceTemplateURIs), "resource templates for", serverName)
 	}
 
 	// Update tracking with new capabilities
 	delete(g.serverCapabilities, serverName)
+	delete(g.serverAvailableCapabilities, serverName)
 
 	return nil
 }

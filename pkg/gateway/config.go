@@ -4,6 +4,7 @@ import "github.com/docker/mcp-gateway/pkg/catalog"
 
 type Config struct {
 	Options
+	WorkingSet         string
 	ServerNames        []string
 	CatalogPath        []string
 	ConfigPath         []string
@@ -15,6 +16,7 @@ type Config struct {
 
 type Options struct {
 	Port                    int
+	Host                    string
 	Transport               string
 	ToolNames               []string
 	Interceptors            []string
@@ -31,8 +33,16 @@ type Options struct {
 	Cpus                    int
 	Memory                  string
 	Static                  bool
-	Central                 bool
 	OAuthInterceptorEnabled bool
 	McpOAuthDcrEnabled      bool
 	DynamicTools            bool
+	ToolNamePrefix          bool
+	LogFilePath             string
+	UseEmbeddings           bool
+	UseProfiles             bool
+	AllowUnauthenticated    bool
+	// PreserveToolSchemaDialect relays downstream tool schemas with the JSON
+	// Schema dialect they were declared in, instead of translating pre-2020-12
+	// dialects that 2020-12-only clients reject.
+	PreserveToolSchemaDialect bool
 }

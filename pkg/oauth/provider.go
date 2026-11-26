@@ -2,18 +2,81 @@ package oauth
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
+	seclient "github.com/docker/secrets-engine/client"
+	"golang.org/x/oauth2"
+
 	"github.com/docker/mcp-gateway/pkg/desktop"
+	"github.com/docker/mcp-gateway/pkg/log"
+	"github.com/docker/mcp-gateway/pkg/oauth/dcr"
 )
 
-const maxRefreshRetries = 7 // Max attempts to refresh when expiry hasn't changed
+// DCRProvider represents a dynamically registered OAuth provider
+// Implements public client + PKCE for security
+type DCRProvider struct {
+	name        string
+	config      *oauth2.Config
+	resourceURL string // For RFC 8707 token audience binding
+}
 
-// Provider manages OAuth token lifecycle for a single MCP server
-// Each provider runs in its own goroutine with dynamic timing based on token expiry
+// NewDCRProvider creates a new DCR provider from a registered DCR client
+func NewDCRProvider(dcrClient dcr.Client, redirectURL string) *DCRProvider {
+	config := &oauth2.Config{
+		ClientID:     dcrClient.ClientID,
+		ClientSecret: "", // Public client - no secret
+		RedirectURL:  redirectURL,
+		Endpoint: oauth2.Endpoint{
+			AuthURL:  dcrClient.AuthorizationEndpoint,
+			TokenURL: dcrClient.TokenEndpoint,
+		},
+		Scopes: dcrClient.RequiredScopes,
+	}
+
+	return &DCRProvider{
+		name:        dcrClient.ServerName,
+		config:      config,
+		resourceURL: dcrClient.ResourceURL,
+	}
+}
+
+// Name returns the provider name
+func (p *DCRProvider) Name() string {
+	return p.name
+}
+
+// Config returns the OAuth2 configuration
+func (p *DCRProvider) Config() *oauth2.Config {
+	return p.config
+}
+
+// ResourceURL returns the resource URL for RFC 8707 token audience binding
+func (p *DCRProvider) ResourceURL() string {
+	return p.resourceURL
+}
+
+// GeneratePKCE generates a new PKCE code verifier
+// The challenge is automatically computed by oauth2 library when using S256ChallengeOption
+func (p *DCRProvider) GeneratePKCE() string {
+	return oauth2.GenerateVerifier()
+}
+
+// Provider manages OAuth token lifecycle for a single MCP server.
+// This is used for background token refresh loops in the gateway.
+//
+// The mode field (cached at construction) determines behavior:
+//   - ModeAuto: runtime IsCEMode() detection (backward compat)
+//   - ModeDesktop: triggers refresh via GetOAuthApp Desktop API; SSE events
+//     interrupt the timer, trigger reload, and reset retry counters.
+//   - ModeCE: refreshes tokens directly via oauth2 library using the
+//     credential helper, then reloads.
+//   - ModeCommunity: refreshes tokens directly via oauth2 library using
+//     docker pass for storage, then reloads.
 type Provider struct {
 	name              string
+	mode              Mode
 	lastRefreshExpiry time.Time
 	refreshRetryCount int
 	stopOnce          sync.Once
@@ -23,29 +86,39 @@ type Provider struct {
 	reloadFn          func(ctx context.Context, serverName string) error
 }
 
-// NewProvider creates a new OAuth provider
-func NewProvider(name string, reloadFn func(context.Context, string) error) *Provider {
+const maxRefreshRetries = 7 // Max attempts to refresh when expiry hasn't changed
+
+// NewProvider creates a new OAuth provider for token refresh.
+// The mode parameter controls which credential storage backend is used.
+// Pass ModeAuto to preserve the existing IsCEMode() runtime behavior.
+func NewProvider(name string, mode Mode, reloadFn func(context.Context, string) error) *Provider {
 	return &Provider{
 		name:       name,
+		mode:       mode,
 		stopChan:   make(chan struct{}),
 		eventChan:  make(chan Event),
-		credHelper: NewOAuthCredentialHelper(),
+		credHelper: NewOAuthCredentialHelperWithMode(mode),
 		reloadFn:   reloadFn,
 	}
 }
 
-// Run starts the provider's background loop
-// Loop dynamically adjusts timing based on token expiry
+// Run starts the provider's background loop.
+// Loop dynamically adjusts timing based on token expiry.
 func (p *Provider) Run(ctx context.Context) {
-	logf("- Started OAuth provider loop for %s", p.name)
-	defer logf("- Stopped OAuth provider loop for %s", p.name)
+	log.Logf("- Started OAuth provider loop for %s", p.name)
+	defer log.Logf("- Stopped OAuth provider loop for %s", p.name)
 
 	for {
 		// Check current token status
-		status, err := p.credHelper.GetTokenStatus(ctx, p.name)
+		serverID, err := seclient.ParseID(p.name)
 		if err != nil {
-			logf("! Unable to get token status for %s: %v", p.name, err)
-			logf("! Run 'docker mcp oauth authorize %s' if not yet authorized", p.name)
+			log.Logf("! Invalid server name %q: %v", p.name, err)
+			return
+		}
+		status, err := p.credHelper.GetTokenStatus(ctx, serverID)
+		if err != nil {
+			log.Logf("! Unable to get token status for %s: %v", p.name, err)
+			log.Logf("! Run 'docker mcp oauth authorize %s' if not yet authorized", p.name)
 			return
 		}
 
@@ -58,96 +131,110 @@ func (p *Provider) Run(ctx context.Context) {
 			expiryUnchanged := !p.lastRefreshExpiry.IsZero() && status.ExpiresAt.Equal(p.lastRefreshExpiry)
 
 			if expiryUnchanged {
-				// Expiry unchanged - increment retry count
 				p.refreshRetryCount++
 			} else {
-				// Expiry changed or first attempt for this expiry - reset count
 				if p.refreshRetryCount > 0 {
-					logf("- Token expiry updated for %s, resetting refresh count", p.name)
+					log.Logf("- Token expiry updated for %s, resetting refresh count", p.name)
 				}
 				p.refreshRetryCount = 1
 			}
 
-			// Check if exceeded max attempts
 			if p.refreshRetryCount > maxRefreshRetries {
-				logf("! Token expiry unchanged after %d refresh attempts for %s", maxRefreshRetries, p.name)
+				log.Logf("! Token expiry unchanged after %d refresh attempts for %s", maxRefreshRetries, p.name)
 				return
 			}
 
-			// Exponential backoff for all refresh attempts: 30s, 1min, 2min, 4min, 8min...
+			// Exponential backoff: 30s, 1min, 2min, 4min, 8min...
 			waitDuration = time.Duration(30*(1<<(p.refreshRetryCount-1))) * time.Second
-			logf("- Triggering token refresh for %s, attempt %d/%d, waiting %v",
+			log.Logf("- Triggering token refresh for %s, attempt %d/%d, waiting %v",
 				p.name, p.refreshRetryCount, maxRefreshRetries, waitDuration)
 
 			p.lastRefreshExpiry = status.ExpiresAt
 			shouldTriggerRefresh = true
 
 		} else {
-			// Token valid - wait until 10s before expiry
+			if status.ExpiresAt.IsZero() {
+				// No expiry information available — can't schedule proactive refresh.
+				// Fall back to SSE events (Desktop mode) for refresh notification.
+				log.Logf("- No token expiry info for %s, stopping provider loop (SSE events will handle refresh)", p.name)
+				return
+			}
 			timeUntilExpiry := time.Until(status.ExpiresAt)
 			waitDuration = max(0, timeUntilExpiry-10*time.Second)
-
-			logf("- Token valid for %s, next check in %v", p.name, waitDuration.Round(time.Second))
+			log.Logf("- Token valid for %s, next check in %v", p.name, waitDuration.Round(time.Second))
 			shouldTriggerRefresh = false
 		}
 
-		// Trigger refresh if needed (before waiting)
+		// Trigger refresh if needed
 		if shouldTriggerRefresh {
-			go func() {
-				authClient := desktop.NewAuthClient()
-				app, err := authClient.GetOAuthApp(context.Background(), p.name)
-				if err != nil {
-					logf("! GetOAuthApp failed for %s: %v", p.name, err)
-					return
-				}
-
-				if !app.Authorized {
-					logf("! GetOAuthApp returned Authorized=false for %s", p.name)
-					return
-				}
-				// Authorized: SSE event will be handled below
-			}()
+			switch p.resolveRefreshMode() {
+			case ModeCE:
+				// CE mode: Refresh token directly, then reload server connection
+				go func() {
+					if err := p.refreshTokenCE(ctx); err != nil {
+						log.Logf("! Token refresh failed for %s: %v", p.name, err)
+						return
+					}
+					if err := p.reloadFn(ctx, p.name); err != nil {
+						log.Logf("! Failed to reload %s after token refresh: %v", p.name, err)
+					}
+				}()
+			case ModeCommunity:
+				// Community mode: Refresh token via oauth2, store in docker pass
+				go func() {
+					if err := p.refreshTokenCommunity(ctx); err != nil {
+						log.Logf("! Token refresh failed for %s: %v", p.name, err)
+						return
+					}
+					if err := p.reloadFn(ctx, p.name); err != nil {
+						log.Logf("! Failed to reload %s after token refresh: %v", p.name, err)
+					}
+				}()
+			default:
+				// Desktop mode: Trigger refresh via Desktop API
+				go func() {
+					authClient := desktop.NewAuthClient()
+					app, err := authClient.GetOAuthApp(context.Background(), p.name)
+					if err != nil {
+						log.Logf("! GetOAuthApp failed for %s: %v", p.name, err)
+						return
+					}
+					if !app.Authorized {
+						log.Logf("! GetOAuthApp returned Authorized=false for %s", p.name)
+						return
+					}
+				}()
+			}
 		}
 
-		// Common wait pattern - interruptible by SSE events
+		// Wait pattern - interruptible by login events
 		if waitDuration > 0 {
 			timer := time.NewTimer(waitDuration)
-
 			select {
 			case <-timer.C:
-				// Wait complete - loop back to check token
-
+				// Wait complete
 			case event := <-p.eventChan:
-				// SSE event arrived - handle it
 				timer.Stop()
-				logf("- Provider %s received event: %s", p.name, event.Type)
-
+				log.Logf("- Provider %s received event: %s", p.name, event.Type)
 				if err := p.reloadFn(ctx, p.name); err != nil {
-					logf("- Failed to reload %s after %s: %v", p.name, event.Type, err)
+					log.Logf("- Failed to reload %s after %s: %v", p.name, event.Type, err)
 				}
-
-				// Reset refresh state on successful event
-				if event.Type == EventLoginSuccess || event.Type == EventTokenRefresh {
+				if event.Type == EventLoginSuccess {
 					p.refreshRetryCount = 0
 					p.lastRefreshExpiry = time.Time{}
 				}
-				// Loop back to check fresh token
-
 			case <-p.stopChan:
 				timer.Stop()
 				return
-
 			case <-ctx.Done():
 				timer.Stop()
 				return
 			}
 		}
-		// If waitDuration = 0, loops back immediately
 	}
 }
 
 // Stop signals the provider to shutdown gracefully
-// Safe to call multiple times - stopChan only closed once
 func (p *Provider) Stop() {
 	p.stopOnce.Do(func() {
 		close(p.stopChan)
@@ -157,4 +244,110 @@ func (p *Provider) Stop() {
 // SendEvent sends an SSE event to this provider's event channel
 func (p *Provider) SendEvent(event Event) {
 	p.eventChan <- event
+}
+
+// resolveRefreshMode returns the effective mode for refresh branching.
+// When mode is ModeAuto, falls back to the runtime IsCEMode() check.
+func (p *Provider) resolveRefreshMode() Mode {
+	if p.mode == ModeAuto {
+		if IsCEMode() {
+			return ModeCE
+		}
+		return ModeDesktop
+	}
+	return p.mode
+}
+
+// refreshTokenCommunity refreshes an OAuth token for a community server.
+// Reads the DCR client and current token from docker pass (via Secrets Engine),
+// refreshes using the oauth2 library, and writes the new token back to docker pass.
+func (p *Provider) refreshTokenCommunity(ctx context.Context) error {
+	// Get DCR client from docker pass
+	dcrClient, err := GetDCRClientFromDockerPass(ctx, p.name)
+	if err != nil {
+		return fmt.Errorf("failed to get DCR client from docker pass: %w", err)
+	}
+	if err := validateOutboundDCRClientEndpoints(ctx, dcrClient); err != nil {
+		return err
+	}
+
+	// Get current token from docker pass
+	token, err := GetTokenFromDockerPass(ctx, p.name)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve token from docker pass: %w", err)
+	}
+
+	// Refresh token using oauth2 library.
+	// The redirect URI value does not matter for refresh token grants -- the
+	// Go oauth2 library does not include redirect_uri in the token refresh
+	// request. We pass DefaultRedirectURI only because NewDCRProvider requires
+	// a value; the actual localhost redirect used during authorization is not
+	// persisted in the DCR client struct.
+	provider := NewDCRProvider(dcrClient, DefaultRedirectURI)
+	config := provider.Config()
+
+	// Inject proxy transport so the token endpoint is reachable through
+	// Docker Desktop's HTTP proxy when applicable, while blocking unsafe
+	// derived OAuth endpoints.
+	proxyCtx := context.WithValue(ctx, oauth2.HTTPClient, NewCredentialHTTPClient(ctx, 0))
+
+	refreshedToken, err := config.TokenSource(proxyCtx, token).Token()
+	if err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+
+	// Save refreshed token to docker pass
+	if err := SaveTokenToDockerPass(ctx, p.name, refreshedToken); err != nil {
+		return fmt.Errorf("failed to save refreshed token to docker pass: %w", err)
+	}
+
+	log.Logf("- Successfully refreshed token for %s (docker pass)", p.name)
+	return nil
+}
+
+// refreshTokenCE refreshes an OAuth token in CE mode
+// Uses the same oauth2 library refresh mechanism as Desktop
+func (p *Provider) refreshTokenCE(ctx context.Context) error {
+	// Create read-write credential helper for save operations
+	rwHelper := NewReadWriteCredentialHelper()
+
+	// Get DCR client from credential helper
+	dcrMgr := dcr.NewManager(rwHelper, "")
+	dcrClient, err := dcrMgr.GetDCRClient(p.name)
+	if err != nil {
+		return fmt.Errorf("failed to get DCR client: %w", err)
+	}
+	if err := validateOutboundDCRClientEndpoints(ctx, dcrClient); err != nil {
+		return err
+	}
+
+	// Get current token and create token store
+	tokenStore := NewTokenStore(rwHelper)
+	token, err := tokenStore.Retrieve(dcrClient)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve token: %w", err)
+	}
+
+	// Refresh token using oauth2 library
+	provider := NewDCRProvider(dcrClient, DefaultRedirectURI)
+	config := provider.Config()
+
+	// Inject proxy transport so the token endpoint is reachable through
+	// Docker Desktop's HTTP proxy when applicable, while blocking unsafe
+	// derived OAuth endpoints.
+	proxyCtx := context.WithValue(ctx, oauth2.HTTPClient, NewCredentialHTTPClient(ctx, 0))
+
+	// TokenSource automatically refreshes using refresh_token
+	refreshedToken, err := config.TokenSource(proxyCtx, token).Token()
+	if err != nil {
+		return fmt.Errorf("token refresh failed: %w", err)
+	}
+
+	// Save refreshed token
+	if err := tokenStore.Save(dcrClient, refreshedToken); err != nil {
+		return fmt.Errorf("failed to save refreshed token: %w", err)
+	}
+
+	log.Logf("- Successfully refreshed token for %s", p.name)
+	return nil
 }

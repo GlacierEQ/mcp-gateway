@@ -2,12 +2,16 @@ package catalog
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/docker/mcp-gateway/pkg/remoteurl"
 )
 
 func TestCatalogGetWithConfigured(t *testing.T) {
@@ -131,7 +135,7 @@ func TestCatalogPrecedenceOrder(t *testing.T) {
 	ctx := context.Background()
 
 	// Test precedence order: Docker → Configured → CLI-specified
-	additionalCatalogs := []string{filepath.Join(tempHome, "cli-catalog.yaml")}
+	additionalCatalogs := []string{filepath.Join(tempHome, ".docker", "mcp", "catalogs", "cli-catalog.yaml")}
 	catalog, err := GetWithOptions(ctx, true, additionalCatalogs)
 	require.NoError(t, err)
 
@@ -151,6 +155,105 @@ func TestCatalogPrecedenceOrder(t *testing.T) {
 	require.Len(t, overlappingServer.Tools, 1, "should have exactly the tools from winning server")
 	assert.Equal(t, "overlapping-tool", overlappingServer.Tools[0].Name, "tool name should be preserved")
 	assert.Equal(t, "CLI Catalog Server", overlappingServer.Tools[0].Description, "should use entire server from highest precedence catalog")
+}
+
+func TestReadOneRejectsCatalogPathTraversal(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	cwd := t.TempDir()
+	originalCwd, err := os.Getwd()
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = os.Chdir(originalCwd)
+	})
+	require.NoError(t, os.Chdir(cwd))
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "absolute path outside catalogs dir",
+			path: filepath.Join(t.TempDir(), "outside.yaml"),
+		},
+		{
+			name: "dot-relative path outside catalogs dir",
+			path: "./outside.yaml",
+		},
+		{
+			name: "relative traversal outside catalogs dir",
+			path: "../outside.yaml",
+		},
+		{
+			name: "nested relative traversal outside catalogs dir",
+			path: "nested/../../outside.yaml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := ReadOne(t.Context(), tt.path)
+			require.ErrorIs(t, err, errUntrustedLocalPath)
+		})
+	}
+}
+
+func TestReadOneRejectsUnsafeRemoteCatalogURL(t *testing.T) {
+	_, _, _, err := ReadOne(t.Context(), "https://127.0.0.1/docker-mcp.yaml")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not allowed")
+}
+
+func TestReadOneAllowsLocalHTTPRemoteCatalogWithOptIn(t *testing.T) {
+	t.Setenv(remoteurl.AllowInsecureRemoteURLEnv, "1")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("registry: {}\n"))
+	}))
+	t.Cleanup(server.Close)
+
+	catalog, _, _, err := ReadOne(t.Context(), server.URL)
+	require.NoError(t, err)
+	assert.Empty(t, catalog.Servers)
+}
+
+func TestReadOneRejectsSymlinkEscape(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	catalogsDir := filepath.Join(tempHome, ".docker", "mcp", "catalogs")
+	require.NoError(t, os.MkdirAll(catalogsDir, 0o755))
+
+	outsideCatalog := filepath.Join(t.TempDir(), "outside.yaml")
+	require.NoError(t, os.WriteFile(outsideCatalog, []byte("registry: {}\n"), 0o644))
+	if err := os.Symlink(outsideCatalog, filepath.Join(catalogsDir, "escape.yaml")); err != nil {
+		t.Skipf("symlink creation is not available: %v", err)
+	}
+
+	_, _, _, err := ReadOne(t.Context(), "escape.yaml")
+	require.ErrorIs(t, err, errUntrustedLocalPath)
+}
+
+func TestResolveLocalCatalogPathReturnsResolvedPath(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+
+	catalogsDir := filepath.Join(tempHome, ".docker", "mcp", "catalogs")
+	require.NoError(t, os.MkdirAll(catalogsDir, 0o755))
+
+	targetCatalog := filepath.Join(catalogsDir, "target.yaml")
+	require.NoError(t, os.WriteFile(targetCatalog, []byte("registry: {}\n"), 0o644))
+	if err := os.Symlink(targetCatalog, filepath.Join(catalogsDir, "link.yaml")); err != nil {
+		t.Skipf("symlink creation is not available: %v", err)
+	}
+
+	resolvedTarget, err := filepath.EvalSymlinks(targetCatalog)
+	require.NoError(t, err)
+
+	path, err := ResolveLocalCatalogPath("link.yaml")
+	require.NoError(t, err)
+	require.Equal(t, resolvedTarget, path)
 }
 
 // Helper functions
@@ -202,6 +305,46 @@ func setupTestCatalogs(t *testing.T, homeDir string) {
           command: []`
 	err = os.WriteFile(filepath.Join(catalogsDir, "my-catalog.yaml"), []byte(customCatalog), 0o644)
 	require.NoError(t, err)
+}
+
+func TestServer_IsCommunity(t *testing.T) {
+	tests := []struct {
+		name     string
+		server   Server
+		expected bool
+	}{
+		{
+			name:     "nil metadata",
+			server:   Server{},
+			expected: false,
+		},
+		{
+			name:     "empty tags",
+			server:   Server{Metadata: &Metadata{Tags: []string{}}},
+			expected: false,
+		},
+		{
+			name:     "has community tag",
+			server:   Server{Metadata: &Metadata{Tags: []string{"community"}}},
+			expected: true,
+		},
+		{
+			name:     "community among other tags",
+			server:   Server{Metadata: &Metadata{Tags: []string{"featured", "community", "ai"}}},
+			expected: true,
+		},
+		{
+			name:     "no community tag",
+			server:   Server{Metadata: &Metadata{Tags: []string{"featured", "official"}}},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.server.IsCommunity())
+		})
+	}
 }
 
 func setupOverlappingCatalogs(t *testing.T, homeDir string) {
@@ -265,6 +408,6 @@ func setupOverlappingCatalogs(t *testing.T, homeDir string) {
         container:
           image: cli/overlapping-server
           command: []`
-	err = os.WriteFile(filepath.Join(homeDir, "cli-catalog.yaml"), []byte(cliCatalog), 0o644)
+	err = os.WriteFile(filepath.Join(catalogsDir, "cli-catalog.yaml"), []byte(cliCatalog), 0o644)
 	require.NoError(t, err)
 }

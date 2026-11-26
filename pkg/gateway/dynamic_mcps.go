@@ -4,11 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"slices"
-	"strings"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -17,24 +13,23 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/docker/mcp-gateway/pkg/catalog"
-	"github.com/docker/mcp-gateway/pkg/desktop"
-	"github.com/docker/mcp-gateway/pkg/oauth"
-	"github.com/docker/mcp-gateway/pkg/oci"
 	"github.com/docker/mcp-gateway/pkg/telemetry"
 )
 
 // mcpFindTool implements a tool for finding MCP servers in the catalog
-func (g *Gateway) createMcpFindTool(configuration Configuration) *ToolRegistration {
+func (g *Gateway) createMcpFindTool(_ Configuration, handler mcp.ToolHandler) *ToolRegistration {
 	tool := &mcp.Tool{
-		Name:        "mcp-find",
-		Description: "Find MCP servers in the current catalog by name or description. Returns matching servers with their details.",
+		Name: "mcp-find",
+		Description: `Find MCP servers in the current catalog by name, title, or description.
+If the user is looking for new capabilities, use this tool to search the MCP catalog for servers that should potentially be enabled.
+This will not enable the server but will return information about servers that could be enabled.
+If we find an mcp server, it can be added with the mcp-add tool, and configured with mcp-config-set.`,
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
 				"query": {
 					Type:        "string",
-					Description: "Search query to find servers by name or description (case-insensitive)",
+					Description: "Search query to find servers by name, title, or description (case-insensitive)",
 				},
 				"limit": {
 					Type:        "integer",
@@ -45,175 +40,17 @@ func (g *Gateway) createMcpFindTool(configuration Configuration) *ToolRegistrati
 		},
 	}
 
-	handler := func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Parse parameters
-		var params struct {
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
-		}
-
-		if req.Params.Arguments == nil {
-			return nil, fmt.Errorf("missing arguments")
-		}
-
-		paramsBytes, err := json.Marshal(req.Params.Arguments)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal arguments: %w", err)
-		}
-
-		if err := json.Unmarshal(paramsBytes, &params); err != nil {
-			return nil, fmt.Errorf("failed to parse arguments: %w", err)
-		}
-
-		if params.Query == "" {
-			return nil, fmt.Errorf("query parameter is required")
-		}
-
-		if params.Limit <= 0 {
-			params.Limit = 10
-		}
-
-		// Search through the catalog servers
-		query := strings.ToLower(strings.TrimSpace(params.Query))
-		var matches []ServerMatch
-
-		for serverName, server := range configuration.servers {
-			match := false
-			score := 0
-
-			// Check server name (exact match gets higher score)
-			serverNameLower := strings.ToLower(serverName)
-			if serverNameLower == query {
-				match = true
-				score = 100
-			} else if strings.Contains(serverNameLower, query) {
-				match = true
-				score = 50
-			}
-
-			// Check server description
-			if server.Description != "" {
-				descriptionLower := strings.ToLower(server.Description)
-				if descriptionLower == query {
-					match = true
-					score = maxInt(score, 95)
-				} else if strings.Contains(descriptionLower, query) {
-					match = true
-					score = maxInt(score, 45)
-				}
-			}
-
-			// Check if it has tools that might match
-			for _, tool := range server.Tools {
-				toolNameLower := strings.ToLower(tool.Name)
-				toolDescLower := strings.ToLower(tool.Description)
-
-				if toolNameLower == query {
-					match = true
-					score = maxInt(score, 90)
-				} else if strings.Contains(toolNameLower, query) {
-					match = true
-					score = maxInt(score, 40)
-				} else if strings.Contains(toolDescLower, query) {
-					match = true
-					score = maxInt(score, 30)
-				}
-			}
-
-			// Check image name
-			if server.Image != "" {
-				imageLower := strings.ToLower(server.Image)
-				if strings.Contains(imageLower, query) {
-					match = true
-					score = maxInt(score, 20)
-				}
-			}
-
-			if match {
-				matches = append(matches, ServerMatch{
-					Name:   serverName,
-					Server: server,
-					Score:  score,
-				})
-			}
-		}
-
-		// Sort matches by score (higher scores first)
-		for i := range len(matches) - 1 {
-			for j := i + 1; j < len(matches); j++ {
-				if matches[i].Score < matches[j].Score {
-					matches[i], matches[j] = matches[j], matches[i]
-				}
-			}
-		}
-
-		// Limit results
-		if len(matches) > params.Limit {
-			matches = matches[:params.Limit]
-		}
-
-		// Format results
-		var results []map[string]any
-		for _, match := range matches {
-			serverInfo := map[string]any{
-				"name": match.Name,
-			}
-
-			if match.Server.Description != "" {
-				serverInfo["description"] = match.Server.Description
-			}
-
-			if len(match.Server.Secrets) > 0 {
-				var secrets []string
-				for _, secret := range match.Server.Secrets {
-					secrets = append(secrets, secret.Name)
-				}
-				serverInfo["required_secrets"] = secrets
-			}
-
-			if len(match.Server.Config) > 0 {
-				serverInfo["config_schema"] = match.Server.Config
-			}
-
-			serverInfo["long_lived"] = match.Server.LongLived
-
-			results = append(results, serverInfo)
-		}
-
-		response := map[string]any{
-			"query":         params.Query,
-			"total_matches": len(results),
-			"servers":       results,
-		}
-
-		responseBytes, err := json.Marshal(response)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal response: %w", err)
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: string(responseBytes)}},
-		}, nil
-	}
-
 	return &ToolRegistration{
 		Tool:    tool,
 		Handler: withToolTelemetry("mcp-find", handler),
 	}
 }
 
-// ServerMatch represents a search result
-type ServerMatch struct {
-	Name   string
-	Server catalog.Server
-	Score  int
-}
-
-// mcpAddTool implements a tool for adding new servers to the registry
 func (g *Gateway) createMcpAddTool(clientConfig *clientConfig) *ToolRegistration {
 	tool := &mcp.Tool{
-		Name:        "mcp-add",
-		Description: "Add a new MCP server to the session. The server must exist in the catalog.",
+		Name: "mcp-add",
+		Description: `Add a new MCP server to the session. 
+The server must already be enabled or be authorized by an enforcing policy provider.`,
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
@@ -221,142 +58,128 @@ func (g *Gateway) createMcpAddTool(clientConfig *clientConfig) *ToolRegistration
 					Type:        "string",
 					Description: "Name of the MCP server to add to the registry (must exist in catalog)",
 				},
+				"activate": {
+					Type:        "boolean",
+					Description: "Activate all of the server's tools in the current session",
+					Default:     json.RawMessage("true"),
+				},
 			},
 			Required: []string{"name"},
 		},
 	}
 
-	handler := func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Parse parameters
-		var params struct {
-			Name string `json:"name"`
-		}
+	return &ToolRegistration{
+		Tool:    tool,
+		Handler: withToolTelemetry("mcp-add", addServerHandler(g, clientConfig)),
+	}
+}
 
-		if req.Params.Arguments == nil {
-			return nil, fmt.Errorf("missing arguments")
-		}
-
-		paramsBytes, err := json.Marshal(req.Params.Arguments)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal arguments: %w", err)
-		}
-
-		if err := json.Unmarshal(paramsBytes, &params); err != nil {
-			return nil, fmt.Errorf("failed to parse arguments: %w", err)
-		}
-
-		if params.Name == "" {
-			return nil, fmt.Errorf("name parameter is required")
-		}
-
-		serverName := strings.TrimSpace(params.Name)
-
-		// Check if server exists in catalog
-		_, _, found := g.configuration.Find(serverName)
-		if !found {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("Error: Server '%s' not found in catalog. Use mcp-find to search for available servers.", serverName),
-				}},
-			}, nil
-		}
-
-		// Append the new server to the current serverNames if not already present
-		found = false
-		for _, existing := range g.configuration.serverNames {
-			if existing == serverName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			g.configuration.serverNames = append(g.configuration.serverNames, serverName)
-		}
-
-		// Fetch updated secrets for the new server list
-		if g.configurator != nil {
-			if fbc, ok := g.configurator.(*FileBasedConfiguration); ok {
-				updatedSecrets, err := fbc.readDockerDesktopSecrets(ctx, g.configuration.servers, g.configuration.serverNames)
-				if err == nil {
-					g.configuration.secrets = updatedSecrets
-				} else {
-					log("Warning: Failed to update secrets:", err)
-				}
-			}
-		}
-
-		if err := g.reloadServerConfiguration(ctx, serverName, clientConfig); err != nil {
-			return nil, fmt.Errorf("failed to reload configuration: %w", err)
-		}
-
-		// Register DCR client and start OAuth provider if this is a remote OAuth server
-		if g.McpOAuthDcrEnabled {
-			// Register DCR client with DD so user can authorize
-			if err := oauth.RegisterProviderForLazySetup(ctx, serverName); err != nil {
-				logf("Warning: Failed to register OAuth provider for %s: %v", serverName, err)
-			}
-
-			// Start provider
-			g.startProvider(ctx, serverName)
-
-			// Check if current serverSession supports elicitations
-			if req.Session.InitializeParams().Capabilities != nil && req.Session.InitializeParams().Capabilities.Elicitation != nil {
-				// Elicit a response from the client asking whether to open a browser for authorization
-				elicitResult, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
-					Message: fmt.Sprintf("Would you like to open a browser to authorize the '%s' server?", serverName),
-					RequestedSchema: &jsonschema.Schema{
-						Type: "object",
-						Properties: map[string]*jsonschema.Schema{
-							"authorize": {
-								Type:        "boolean",
-								Description: "Whether to open the browser for authorization",
-							},
-						},
-						Required: []string{"authorize"},
-					},
-				})
-				if err != nil {
-					logf("Warning: Failed to elicit authorization response for %s: %v", serverName, err)
-				} else if elicitResult.Action == "accept" && elicitResult.Content != nil {
-					// Check if user authorized
-					if authorize, ok := elicitResult.Content["authorize"].(bool); ok && authorize {
-						// User agreed to authorize, call the OAuth authorize function
-						client := desktop.NewAuthClient()
-						authResponse, err := client.PostOAuthApp(ctx, serverName, "", false)
-						if err != nil {
-							logf("Warning: Failed to start OAuth flow for %s: %v", serverName, err)
-						} else if authResponse.BrowserURL != "" {
-							logf("Opening browser for authentication: %s", authResponse.BrowserURL)
-						} else {
-							logf("Warning: OAuth provider for %s does not exist", serverName)
-						}
-					}
-				}
-
-				return &mcp.CallToolResult{
-					Content: []mcp.Content{&mcp.TextContent{
-						Text: fmt.Sprintf("Successfully added server '%s'. Authorization completed.", serverName),
-					}},
-				}, nil
-			}
-
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("Successfully added server '%s'. You will need to authorize this server with docker mcp oauth authorize %s", serverName, serverName),
-				}},
-			}, nil
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("Successfully added server '%s'. Assume that it is fully configured and ready to use.", serverName),
-			}},
-		}, nil
+// mcpConfigSetTool implements a tool for setting configuration values for MCP servers
+func (g *Gateway) createMcpConfigSetTool(_ *clientConfig) *ToolRegistration {
+	tool := &mcp.Tool{
+		Name: "mcp-config-set",
+		Description: `Set configuration for an MCP server. 
+The server must already be enabled or be authorized by an enforcing policy provider.
+The config object will be validated against the server's config schema. If validation fails, the error message will include the correct schema.`,
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"server": {
+					Type:        "string",
+					Description: "Name of the MCP server to configure",
+				},
+				"config": {
+					Type:        "object",
+					Description: "Configuration object for the server. This will be validated against the server's config schema.",
+				},
+			},
+			Required: []string{"server", "config"},
+		},
 	}
 
 	return &ToolRegistration{
 		Tool:    tool,
-		Handler: withToolTelemetry("mcp-add", handler),
+		Handler: withToolTelemetry("mcp-config-set", configSetHandler(g)),
+	}
+}
+
+func (g *Gateway) createMcpCreateProfileTool(_ *clientConfig) *ToolRegistration {
+	tool := &mcp.Tool{
+		Name: "mcp-create-profile",
+		Description: `Create or update a profile with the current gateway state.
+A profile is a snapshot of all currently enabled servers and their configurations.
+If a profile with the given name already exists, it will be updated with the current state.`,
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"name": {
+					Type:        "string",
+					Description: "Name of the profile to create or update",
+				},
+			},
+			Required: []string{"name"},
+		},
+	}
+
+	return &ToolRegistration{
+		Tool:    tool,
+		Handler: withToolTelemetry("mcp-create-profile", createProfileHandler(g)),
+	}
+}
+
+func (g *Gateway) createMcpActivateProfileTool(clientConfig *clientConfig) *ToolRegistration {
+	tool := &mcp.Tool{
+		Name: "mcp-activate-profile",
+		Description: `Activate a saved profile by loading its servers into the current gateway.
+This will merge the profile's servers with currently active servers.
+Servers that are already active will be skipped.`,
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"name": {
+					Type:        "string",
+					Description: "Profile ID to activate",
+				},
+			},
+			Required: []string{"name"},
+		},
+	}
+
+	return &ToolRegistration{
+		Tool:    tool,
+		Handler: withToolTelemetry("mcp-activate-profile", activateProfileHandler(g, clientConfig)),
+	}
+}
+
+func (g *Gateway) createCodeModeTool(_ *clientConfig) *ToolRegistration {
+	tool := &mcp.Tool{
+		Name: "code-mode",
+		Description: `Create a JavaScript-enabled tool that combines multiple MCP server tools. 
+This allows you to write scripts that call multiple tools and combine their results.
+Use the mcp-find tool to find servers and make sure they are are ready with the mcp-add tool. When running
+mcp-add, we don't have to activate the tools.
+`,
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"servers": {
+					Type:        "array",
+					Description: "List of MCP server names whose tools should be available in the JavaScript environment",
+					Items: &jsonschema.Schema{
+						Type: "string",
+					},
+				},
+				"name": {
+					Type:        "string",
+					Description: "Name for the new code-mode tool (will be prefixed with 'code-mode-')",
+				},
+			},
+			Required: []string{"servers", "name"},
+		},
+	}
+	return &ToolRegistration{
+		Tool:    tool,
+		Handler: withToolTelemetry("code-mode", addCodemodeHandler(g)),
 	}
 }
 
@@ -377,61 +200,13 @@ func (g *Gateway) createMcpRemoveTool() *ToolRegistration {
 		},
 	}
 
-	handler := func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Parse parameters
-		var params struct {
-			Name string `json:"name"`
-		}
-
-		if req.Params.Arguments == nil {
-			return nil, fmt.Errorf("missing arguments")
-		}
-
-		paramsBytes, err := json.Marshal(req.Params.Arguments)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal arguments: %w", err)
-		}
-
-		if err := json.Unmarshal(paramsBytes, &params); err != nil {
-			return nil, fmt.Errorf("failed to parse arguments: %w", err)
-		}
-
-		if params.Name == "" {
-			return nil, fmt.Errorf("name parameter is required")
-		}
-
-		serverName := strings.TrimSpace(params.Name)
-
-		// Remove the server from the current serverNames
-		updatedServerNames := slices.DeleteFunc(slices.Clone(g.configuration.serverNames), func(name string) bool {
-			return name == serverName
-		})
-
-		// Update the current configuration state
-		g.configuration.serverNames = updatedServerNames
-
-		// Stop OAuth provider if this is an OAuth server
-		if g.McpOAuthDcrEnabled {
-			g.stopProvider(serverName)
-		}
-
-		if err := g.removeServerConfiguration(ctx, serverName); err != nil {
-			return nil, fmt.Errorf("failed to remove server configuration: %w", err)
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: fmt.Sprintf("Successfully removed server '%s'.", serverName),
-			}},
-		}, nil
-	}
-
 	return &ToolRegistration{
 		Tool:    tool,
-		Handler: withToolTelemetry("mcp-remove", handler),
+		Handler: withToolTelemetry("mcp-remove", removeServerHandler(g)),
 	}
 }
 
+//nolint:unused
 func (g *Gateway) createMcpRegistryImportTool(configuration Configuration, _ *clientConfig) *ToolRegistration {
 	tool := &mcp.Tool{
 		Name:        "mcp-registry-import",
@@ -448,280 +223,58 @@ func (g *Gateway) createMcpRegistryImportTool(configuration Configuration, _ *cl
 		},
 	}
 
-	handler := func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Parse parameters
-		var params struct {
-			URL string `json:"url"`
-		}
-
-		if req.Params.Arguments == nil {
-			return nil, fmt.Errorf("missing arguments")
-		}
-
-		paramsBytes, err := json.Marshal(req.Params.Arguments)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal arguments: %w", err)
-		}
-
-		if err := json.Unmarshal(paramsBytes, &params); err != nil {
-			return nil, fmt.Errorf("failed to parse arguments: %w", err)
-		}
-
-		if params.URL == "" {
-			return nil, fmt.Errorf("url parameter is required")
-		}
-
-		registryURL := strings.TrimSpace(params.URL)
-
-		// Validate URL scheme
-		if !strings.HasPrefix(registryURL, "http://") && !strings.HasPrefix(registryURL, "https://") {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("Error: URL must start with http:// or https://, got: %s", registryURL),
-				}},
-			}, nil
-		}
-
-		// Fetch servers from the URL
-		servers, err := g.readServersFromURL(ctx, registryURL)
-		if err != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("Error fetching servers from URL %s: %v", registryURL, err),
-				}},
-			}, nil
-		}
-
-		if len(servers) == 0 {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{
-					Text: fmt.Sprintf("No servers found at URL: %s", registryURL),
-				}},
-			}, nil
-		}
-
-		// Add the imported servers to the current configuration and build detailed summary
-		var importedServerNames []string
-		var serverSummaries []string
-
-		for serverName, server := range servers {
-			if _, exists := configuration.servers[serverName]; exists {
-				log(fmt.Sprintf("Warning: server '%s' from URL %s overwrites existing server", serverName, registryURL))
-			}
-			configuration.servers[serverName] = server
-			importedServerNames = append(importedServerNames, serverName)
-
-			// Build detailed summary for this server
-			summary := fmt.Sprintf("• %s", serverName)
-
-			if server.Description != "" {
-				summary += fmt.Sprintf("\n  Description: %s", server.Description)
-			}
-
-			if server.Image != "" {
-				summary += fmt.Sprintf("\n  Image: %s", server.Image)
-			}
-
-			// List required secrets
-			if len(server.Secrets) > 0 {
-				var secretNames []string
-				for _, secret := range server.Secrets {
-					secretNames = append(secretNames, secret.Name)
-				}
-				summary += fmt.Sprintf("\n  Required Secrets: %s", strings.Join(secretNames, ", "))
-				summary += "\n  ⚠️  Configure these secrets before using this server"
-			}
-
-			// List configuration schemas available
-			if len(server.Config) > 0 {
-				summary += fmt.Sprintf("\n  Configuration Schemas: %d available", len(server.Config))
-				summary += "\n  ℹ️  Use mcp-config-set to configure optional settings"
-			}
-
-			if server.LongLived {
-				summary += "\n  🔄 Long-lived server (stays running)"
-			}
-
-			serverSummaries = append(serverSummaries, summary)
-		}
-
-		// Create comprehensive result message
-		resultText := fmt.Sprintf("Successfully imported %d servers from %s\n\n", len(importedServerNames), registryURL)
-		resultText += strings.Join(serverSummaries, "\n\n")
-
-		if len(importedServerNames) > 0 {
-			resultText += fmt.Sprintf("\n\n✅ Servers ready to use: %s", strings.Join(importedServerNames, ", "))
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: resultText,
-			}},
-		}, nil
-	}
-
 	return &ToolRegistration{
 		Tool:    tool,
-		Handler: withToolTelemetry("mcp-registry-import", handler),
+		Handler: withToolTelemetry("mcp-registry-import", registryImportHandler(g, configuration)),
 	}
 }
 
-// readServersFromURL fetches and parses server definitions from a URL
-func (g *Gateway) readServersFromURL(ctx context.Context, url string) (map[string]catalog.Server, error) {
-	servers := make(map[string]catalog.Server)
-
-	log(fmt.Sprintf("  - Reading servers from URL: %s", url))
-
-	// Create HTTP request with context
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	// Set a reasonable user agent
-	req.Header.Set("User-Agent", "docker-mcp-gateway/1.0.0")
-
-	// Make the HTTP request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch URL: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP request failed with status %d: %s", resp.StatusCode, resp.Status)
-	}
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	// Try to parse as oci.ServerDetail (the new structure)
-	var serverDetail oci.ServerDetail
-	if err := json.Unmarshal(body, &serverDetail); err == nil && serverDetail.Name != "" {
-		// Successfully parsed as ServerDetail - convert to catalog.Server
-		server := serverDetail.ToCatalogServer()
-
-		serverName := serverDetail.Name
-		servers[serverName] = server
-		log(fmt.Sprintf("  - Added server '%s' from URL %s", serverName, url))
-		return servers, nil
-	}
-
-	return nil, fmt.Errorf("unable to parse response as OCI catalog or direct catalog format")
-}
-
-type configValue struct {
-	Server string `json:"server"`
-	Key    string `json:"key"`
-	Value  any    `json:"value"`
-}
-
-// mcpConfigSetTool implements a tool for setting configuration values for MCP servers
-func (g *Gateway) createMcpConfigSetTool(clientConfig *clientConfig) *ToolRegistration {
+// createMcpExecTool implements a tool for executing tools that exist in the current session
+// but may not be returned from listTools calls
+func (g *Gateway) createMcpExecTool() *ToolRegistration {
 	tool := &mcp.Tool{
-		Name:        "mcp-config-set",
-		Description: "Set configuration values for MCP servers. Creates or updates server configuration with the specified key-value pairs.",
+		Name:        "mcp-exec",
+		Description: "Execute a tool that exists in the current session. This allows calling tools that may not be visible in listTools results.",
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
-				"server": {
+				"name": {
 					Type:        "string",
-					Description: "Name of the MCP server to configure",
+					Description: "Name of the tool to execute",
 				},
-				"key": {
-					Type:        "string",
-					Description: "Configuration key to set",
-				},
-				"value": {
-					Description: "Configuration value to set (can be string, number, boolean, or object)",
+				"arguments": {
+					Type:        "object",
+					Description: "Arguments to use for the tool call.",
 				},
 			},
-			Required: []string{"server", "key", "value"},
+			Required: []string{"name"},
 		},
-	}
-
-	handler := func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		// Parse parameters
-		var params configValue
-
-		if req.Params.Arguments == nil {
-			return nil, fmt.Errorf("missing arguments")
-		}
-
-		paramsBytes, err := json.Marshal(req.Params.Arguments)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal arguments: %w", err)
-		}
-
-		if err := json.Unmarshal(paramsBytes, &params); err != nil {
-			return nil, fmt.Errorf("failed to parse arguments: %w", err)
-		}
-
-		if params.Server == "" {
-			return nil, fmt.Errorf("server parameter is required")
-		}
-
-		if params.Key == "" {
-			return nil, fmt.Errorf("key parameter is required")
-		}
-
-		serverName := strings.TrimSpace(params.Server)
-		configKey := strings.TrimSpace(params.Key)
-
-		// Check if server exists in catalog (optional check - we can configure servers that don't exist yet)
-		_, _, serverExists := g.configuration.Find(serverName)
-
-		// Initialize the server's config map if it doesn't exist
-		if g.configuration.config[serverName] == nil {
-			g.configuration.config[serverName] = make(map[string]any)
-		}
-
-		// Set the configuration value
-		oldValue := g.configuration.config[serverName][configKey]
-		g.configuration.config[serverName][configKey] = params.Value
-
-		// Log the configuration change
-		log(fmt.Sprintf("  - Set config for server '%s': %s = %v", serverName, configKey, params.Value))
-
-		// Reload configuration with current server list to apply changes
-		if err := g.reloadServerConfiguration(ctx, serverName, clientConfig); err != nil {
-			return nil, fmt.Errorf("failed to reload configuration: %w", err)
-		}
-
-		var resultMessage string
-		if oldValue != nil {
-			resultMessage = fmt.Sprintf("Successfully updated config for server '%s': %s = %v (was: %v)", serverName, configKey, params.Value, oldValue)
-		} else {
-			resultMessage = fmt.Sprintf("Successfully set config for server '%s': %s = %v", serverName, configKey, params.Value)
-		}
-
-		if !serverExists {
-			resultMessage += fmt.Sprintf(" (Note: server '%s' is not in the current catalog)", serverName)
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{
-				Text: resultMessage,
-			}},
-		}, nil
 	}
 
 	return &ToolRegistration{
 		Tool:    tool,
-		Handler: withToolTelemetry("mcp-config-set", handler),
+		Handler: withToolTelemetry("mcp-exec", addMcpExecHandler(g)),
 	}
 }
 
-// maxInt returns the maximum of two integers
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+//nolint:unused // mcpCatalogTool implements a tool for viewing information about the currently attached catalog
+func (g *Gateway) _createMcpCatalogTool() *ToolRegistration {
+	tool := &mcp.Tool{
+		Name:        "mcp-catalog",
+		Description: "Summarize information about the currently attached catalog, including available servers and their configurations.",
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+		},
 	}
-	return b
+
+	handler := func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return _dockerHubLink(), nil
+	}
+
+	return &ToolRegistration{
+		Tool:    tool,
+		Handler: withToolTelemetry("mcp-catalog", handler),
+	}
 }
 
 // withToolTelemetry wraps a tool handler with telemetry instrumentation

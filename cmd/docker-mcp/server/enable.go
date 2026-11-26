@@ -5,23 +5,32 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/docker/cli/cli/command"
 	"gopkg.in/yaml.v3"
 
+	"github.com/docker/mcp-gateway/cmd/docker-mcp/hints"
 	"github.com/docker/mcp-gateway/pkg/catalog"
 	"github.com/docker/mcp-gateway/pkg/config"
 	"github.com/docker/mcp-gateway/pkg/docker"
-	"github.com/docker/mcp-gateway/pkg/oauth"
+	pkgoauth "github.com/docker/mcp-gateway/pkg/oauth"
 )
 
-func Disable(ctx context.Context, docker docker.Client, serverNames []string, mcpOAuthDcrEnabled bool) error {
-	return update(ctx, docker, nil, serverNames, mcpOAuthDcrEnabled)
+// Function pointers for testability (same pattern as pkg/workingset/oauth.go).
+var (
+	shouldUseGatewayOAuthForEnableFunc    = pkgoauth.ShouldUseGatewayOAuth
+	registerProviderForLazySetupFunc      = pkgoauth.RegisterProviderForLazySetup
+	registerForDynamicDiscoveryEnableFunc = pkgoauth.RegisterProviderForDynamicDiscovery
+)
+
+func Disable(ctx context.Context, docker docker.Client, dockerCli command.Cli, serverNames []string, mcpOAuthDcrEnabled bool) error {
+	return update(ctx, docker, dockerCli, nil, serverNames, mcpOAuthDcrEnabled)
 }
 
-func Enable(ctx context.Context, docker docker.Client, serverNames []string, mcpOAuthDcrEnabled bool) error {
-	return update(ctx, docker, serverNames, nil, mcpOAuthDcrEnabled)
+func Enable(ctx context.Context, docker docker.Client, dockerCli command.Cli, serverNames []string, mcpOAuthDcrEnabled bool) error {
+	return update(ctx, docker, dockerCli, serverNames, nil, mcpOAuthDcrEnabled)
 }
 
-func update(ctx context.Context, docker docker.Client, add []string, remove []string, mcpOAuthDcrEnabled bool) error {
+func update(ctx context.Context, docker docker.Client, dockerCli command.Cli, add []string, remove []string, mcpOAuthDcrEnabled bool) error {
 	// Read registry.yaml that contains which servers are enabled.
 	registryYAML, err := config.ReadRegistry(ctx, docker)
 	if err != nil {
@@ -58,19 +67,38 @@ func update(ctx context.Context, docker docker.Client, add []string, remove []st
 				Ref: "",
 			}
 
-			// Three-condition check: DCR flag enabled AND type="remote" AND oauth present
-			if mcpOAuthDcrEnabled && server.IsRemoteOAuthServer() {
-				if err := oauth.RegisterProviderForLazySetup(ctx, serverName); err != nil {
-					fmt.Printf("Warning: Failed to register OAuth provider for %s: %v\n", serverName, err)
-					fmt.Printf("   You can run 'docker mcp oauth authorize %s' later to set up authentication.\n", serverName)
+			// DCR flag enabled AND type="remote" AND oauth present
+			if mcpOAuthDcrEnabled && server.HasExplicitOAuthProviders() {
+				isCommunity := server.IsCommunity()
+				if shouldUseGatewayOAuthForEnableFunc(ctx, isCommunity) {
+					// Gateway owns OAuth (CE mode or community + flag ON)
+					fmt.Printf("OAuth server %s enabled. Run 'docker mcp oauth authorize %s' to authenticate\n", serverName, serverName)
 				} else {
-					fmt.Printf("OAuth provider configured for %s - use 'docker mcp oauth authorize %s' to authenticate\n", serverName, serverName)
+					// Desktop mode — register provider for lazy setup
+					if err := registerProviderForLazySetupFunc(ctx, serverName); err != nil {
+						fmt.Printf("Warning: Failed to register OAuth provider for %s: %v\n", serverName, err)
+						fmt.Printf("   You can run 'docker mcp oauth authorize %s' later to set up authentication.\n", serverName)
+					} else {
+						fmt.Printf("OAuth provider configured for %s - use 'docker mcp oauth authorize %s' to authenticate\n", serverName, serverName)
+					}
 				}
-			} else if !mcpOAuthDcrEnabled && server.IsRemoteOAuthServer() {
+			} else if !mcpOAuthDcrEnabled && server.HasExplicitOAuthProviders() {
 				// Provide guidance when DCR is needed but disabled
 				fmt.Printf("Server %s requires OAuth authentication but DCR is disabled.\n", serverName)
 				fmt.Printf("   To enable automatic OAuth setup, run: docker mcp feature enable mcp-oauth-dcr\n")
 				fmt.Printf("   Or set up OAuth manually using: docker mcp oauth authorize %s\n", serverName)
+			} else if mcpOAuthDcrEnabled && server.Type == "remote" && !server.IsOAuthServer() && server.Remote.URL != "" {
+				// Remote server without oauth.providers — dynamic OAuth discovery.
+				// Always register with Desktop for OAuth tab visibility, even when
+				// Gateway owns the OAuth lifecycle (community + flag ON). The
+				// authorize/revoke flow is handled by Gateway via IPC delegation.
+				if err := registerForDynamicDiscoveryEnableFunc(ctx, serverName, server.Remote.URL); err != nil {
+					fmt.Printf("Warning: Dynamic OAuth discovery failed for %s: %v\n", serverName, err)
+				}
+				isCommunity := server.IsCommunity()
+				if shouldUseGatewayOAuthForEnableFunc(ctx, isCommunity) {
+					fmt.Printf("Remote server %s enabled. OAuth handled by Gateway — use 'docker mcp oauth authorize %s' or authorize from Docker Desktop\n", serverName, serverName)
+				}
 			}
 		} else {
 			return fmt.Errorf("server %s not found in catalog", serverName)
@@ -92,6 +120,22 @@ func update(ctx context.Context, docker docker.Client, add []string, remove []st
 
 	if err := config.WriteRegistry(buf.Bytes()); err != nil {
 		return fmt.Errorf("writing registry config: %w", err)
+	}
+
+	if len(add) > 0 && hints.Enabled(dockerCli) {
+		hints.TipCyan.Print("Tip: ")
+		hints.TipGreen.Print("✓")
+		hints.TipCyan.Print(" Server enabled. To view all enabled servers, use ")
+		hints.TipCyanBoldItalic.Println("docker mcp server ls")
+		fmt.Println()
+	}
+
+	if len(remove) > 0 && hints.Enabled(dockerCli) {
+		hints.TipCyan.Print("Tip: ")
+		hints.TipGreen.Print("✓")
+		hints.TipCyan.Print(" Server disabled. To see remaining enabled servers, use ")
+		hints.TipCyanBoldItalic.Println("docker mcp server ls")
+		fmt.Println()
 	}
 
 	return nil

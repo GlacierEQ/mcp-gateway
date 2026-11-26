@@ -1,0 +1,160 @@
+package dcr
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/docker/docker-credential-helpers/credentials"
+
+	"github.com/docker/mcp-gateway/pkg/db"
+	"github.com/docker/mcp-gateway/pkg/log"
+	"github.com/docker/mcp-gateway/pkg/oauthdiscovery"
+)
+
+// Manager orchestrates Dynamic Client Registration flows
+type Manager struct {
+	credentials *Credentials
+	redirectURI string
+}
+
+// NewManager creates a new DCR manager with the specified redirect URI
+func NewManager(credentialHelper credentials.Helper, redirectURI string) *Manager {
+	return &Manager{
+		credentials: NewCredentials(credentialHelper),
+		redirectURI: redirectURI,
+	}
+}
+
+// Credentials returns the credentials store
+func (m *Manager) Credentials() *Credentials {
+	return m.credentials
+}
+
+// GetDCRClient retrieves a DCR client from storage
+func (m *Manager) GetDCRClient(serverName string) (Client, error) {
+	return m.credentials.RetrieveClient(serverName)
+}
+
+// PerformDiscoveryAndRegistration executes OAuth discovery and DCR for a server
+// This is called when no DCR client exists or when it needs re-registration
+func (m *Manager) PerformDiscoveryAndRegistration(ctx context.Context, serverName string, scopes string) error {
+	dcrClient, err := DiscoverAndRegister(ctx, serverName, scopes, m.redirectURI)
+	if err != nil {
+		return err
+	}
+
+	if err := m.credentials.SaveClient(serverName, dcrClient); err != nil {
+		return fmt.Errorf("saving DCR client for %s: %w", serverName, err)
+	}
+
+	log.Logf("- Completed DCR for: %s", serverName)
+	return nil
+}
+
+// DiscoverAndRegister performs OAuth discovery and DCR for a server, returning
+// the resulting Client without persisting it. Callers are responsible for
+// storing the client in the appropriate backend (credential helper, docker pass,
+// etc.). This is the storage-agnostic core of PerformDiscoveryAndRegistration.
+func DiscoverAndRegister(ctx context.Context, serverName string, scopes string, redirectURI string) (Client, error) {
+	log.Logf("- Performing OAuth discovery and DCR for: %s", serverName)
+
+	// Get server URL from catalog
+	serverURL, err := getServerURL(ctx, serverName)
+	if err != nil {
+		return Client{}, fmt.Errorf("getting server URL: %w", err)
+	}
+
+	// Perform OAuth discovery (RFC 9728, RFC 8414)
+	log.Logf("- Starting OAuth discovery for: %s at: %s", serverName, serverURL)
+	discovery, err := oauthdiscovery.DiscoverOAuthRequirements(ctx, serverURL)
+	if err != nil {
+		return Client{}, fmt.Errorf("discovering OAuth requirements for %s: %w", serverName, err)
+	}
+	log.Logf("- Discovery successful for: %s", serverName)
+
+	// Merge user-provided scopes with resource-required scopes
+	mergedScopes := mergeScopes(discovery.Scopes, scopes)
+	if len(mergedScopes) > len(discovery.Scopes) {
+		discovery.Scopes = mergedScopes
+		log.Logf("- Merged scopes for DCR registration: %v", mergedScopes)
+	}
+
+	// Perform Dynamic Client Registration (RFC 7591) with our redirect URI
+	creds, err := oauthdiscovery.PerformDCR(ctx, discovery, serverName, redirectURI)
+	if err != nil {
+		return Client{}, fmt.Errorf("registering DCR client for %s: %w", serverName, err)
+	}
+	log.Logf("- Registration successful for: %s, clientID: %s", serverName, creds.ClientID)
+
+	return Client{
+		ServerName:                             serverName,
+		ProviderName:                           serverName, // For DCR, provider name = server name
+		ClientID:                               creds.ClientID,
+		ClientName:                             fmt.Sprintf("MCP Gateway - %s", serverName),
+		AuthorizationEndpoint:                  creds.AuthorizationEndpoint,
+		AuthorizationServer:                    discovery.AuthorizationServer,
+		TokenEndpoint:                          creds.TokenEndpoint,
+		RevocationEndpoint:                     discovery.RevocationEndpoint,
+		RevocationEndpointAuthMethodsSupported: discovery.RevocationEndpointAuthMethodsSupported,
+		ResourceURL:                            creds.ServerURL,
+		RedirectURI:                            redirectURI,
+		ScopesSupported:                        discovery.ScopesSupported,
+		RequiredScopes:                         discovery.Scopes,
+		RegisteredAt:                           time.Now(),
+	}, nil
+}
+
+// DeleteDCRClient removes a DCR client from storage
+func (m *Manager) DeleteDCRClient(serverName string) error {
+	return m.credentials.DeleteClient(serverName)
+}
+
+// ListDCRClients returns all stored DCR clients
+func (m *Manager) ListDCRClients() (map[string]Client, error) {
+	return m.credentials.ListClients()
+}
+
+// getServerURL retrieves the server URL from the OCI catalog database.
+func getServerURL(ctx context.Context, serverName string) (string, error) {
+	dao, err := db.New()
+	if err != nil {
+		return "", fmt.Errorf("opening database: %w", err)
+	}
+	server, err := db.FindServerInCatalogs(ctx, dao, serverName)
+	if err != nil {
+		return "", err
+	}
+	if server.Remote.URL == "" {
+		return "", fmt.Errorf("server %s is not a remote server or missing URL", serverName)
+	}
+	return server.Remote.URL, nil
+}
+
+// mergeScopes combines resource-required scopes with user-provided scopes
+func mergeScopes(requiredScopes []string, userScopes string) []string {
+	if userScopes == "" || userScopes == " " {
+		return requiredScopes
+	}
+
+	userScopesList := strings.Fields(userScopes)
+	merged := make([]string, len(requiredScopes))
+	copy(merged, requiredScopes)
+
+	// Add user scopes if not already present
+	for _, userScope := range userScopesList {
+		found := false
+		for _, existingScope := range merged {
+			if existingScope == userScope {
+				found = true
+				break
+			}
+		}
+		if !found {
+			merged = append(merged, userScope)
+		}
+	}
+
+	return merged
+}

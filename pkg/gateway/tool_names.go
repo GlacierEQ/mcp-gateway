@@ -1,0 +1,365 @@
+package gateway
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/docker/mcp-gateway/pkg/catalog"
+)
+
+var (
+	errToolNameCollision       = errors.New("tool name collision")
+	errCapabilityNameCollision = errors.New("capability name collision")
+)
+
+type toolNameCollisionError struct {
+	message string
+}
+
+func (e toolNameCollisionError) Error() string {
+	return e.message
+}
+
+func (e toolNameCollisionError) Is(target error) bool {
+	return target == errToolNameCollision
+}
+
+type capabilityNameCollisionError struct {
+	message string
+}
+
+func (e capabilityNameCollisionError) Error() string {
+	return e.message
+}
+
+func (e capabilityNameCollisionError) Is(target error) bool {
+	return target == errCapabilityNameCollision
+}
+
+func isCapabilityNameCollision(err error) bool {
+	return errors.Is(err, errToolNameCollision) || errors.Is(err, errCapabilityNameCollision)
+}
+
+var reservedGatewayToolNames = map[string]struct{}{
+	"code-mode":            {},
+	"find-tools":           {},
+	"mcp-activate-profile": {},
+	"mcp-add":              {},
+	"mcp-config-set":       {},
+	"mcp-create-profile":   {},
+	"mcp-exec":             {},
+	"mcp-find":             {},
+	"mcp-registry-import":  {},
+	"mcp-remove":           {},
+}
+
+var reservedGatewayPromptNames = map[string]struct{}{
+	"mcp-discover": {},
+}
+
+func validateExternalToolNameCollisions(registrations []ToolRegistration, existing map[string]ToolRegistration) error {
+	return validateToolNameCollisions(registrations, existing, true)
+}
+
+func validateToolNameCollisions(registrations []ToolRegistration, existing map[string]ToolRegistration, rejectReserved bool) error {
+	seen := make(map[string]ToolRegistration, len(registrations))
+
+	for _, registration := range sortedToolRegistrations(registrations) {
+		if registration.Tool == nil {
+			continue
+		}
+
+		toolName := strings.TrimSpace(registration.Tool.Name)
+		if toolName == "" {
+			return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s exposes an empty tool name", toolOwner(registration))}
+		}
+
+		if rejectReserved {
+			if reservedName, _, reserved := findEqualFoldMapEntry(reservedGatewayToolNames, toolName); reserved {
+				if reservedName == toolName {
+					return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s exposes reserved gateway tool name %q; enable tool-name-prefix or set a unique catalog prefix", toolOwner(registration), toolName)}
+				}
+				return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s exposes tool name %q, which differs only by case from reserved gateway tool name %q; enable tool-name-prefix or set a unique catalog prefix", toolOwner(registration), toolName, reservedName)}
+			}
+		}
+
+		if previousName, previous, ok := findEqualFoldMapEntry(seen, toolName); ok {
+			if previousName == toolName {
+				return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s and %s both expose tool name %q; enable tool-name-prefix or set unique catalog prefixes", toolOwner(previous), toolOwner(registration), toolName)}
+			}
+			return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s exposes tool name %q and %s exposes case-variant tool name %q; enable tool-name-prefix or set unique catalog prefixes", toolOwner(previous), previousName, toolOwner(registration), toolName)}
+		}
+		seen[toolName] = registration
+
+		if existing == nil {
+			continue
+		}
+		if previousName, previous, ok := findEqualFoldMapEntry(existing, toolName); ok {
+			if previousName == toolName {
+				return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s would shadow %s for tool name %q; enable tool-name-prefix or set a unique catalog prefix", toolOwner(registration), toolOwner(previous), toolName)}
+			}
+			return toolNameCollisionError{message: fmt.Sprintf("tool name collision: %s exposes tool name %q, which differs only by case from %s tool name %q; enable tool-name-prefix or set a unique catalog prefix", toolOwner(registration), toolName, toolOwner(previous), previousName)}
+		}
+	}
+
+	return nil
+}
+
+func findEqualFoldMapEntry[V any](entries map[string]V, candidate string) (string, V, bool) {
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if strings.EqualFold(key, candidate) {
+			return key, entries[key], true
+		}
+	}
+
+	var zero V
+	return "", zero, false
+}
+
+func sortedToolRegistrations(registrations []ToolRegistration) []ToolRegistration {
+	sorted := append([]ToolRegistration(nil), registrations...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		left, right := sorted[i], sorted[j]
+		if left.ServerName != right.ServerName {
+			return left.ServerName < right.ServerName
+		}
+		var leftName, rightName string
+		if left.Tool != nil {
+			leftName = left.Tool.Name
+		}
+		if right.Tool != nil {
+			rightName = right.Tool.Name
+		}
+		return leftName < rightName
+	})
+	return sorted
+}
+
+func toolOwner(registration ToolRegistration) string {
+	if registration.ServerName == "" {
+		return "gateway internal tools"
+	}
+	return fmt.Sprintf("server %q", registration.ServerName)
+}
+
+type capabilityNameIndexes struct {
+	Prompts           map[string]string
+	Resources         map[string]string
+	ResourceTemplates map[string]string
+}
+
+type capabilityIdentityRegistration struct {
+	serverName string
+	identifier string
+}
+
+func validateExternalCapabilityNameCollisions(caps *Capabilities, existing capabilityNameIndexes, rejectReservedPrompts bool) error {
+	if caps == nil {
+		return nil
+	}
+
+	var reservedPrompts map[string]struct{}
+	if rejectReservedPrompts {
+		reservedPrompts = reservedGatewayPromptNames
+	}
+	if err := validateCapabilityIdentityCollisions(
+		"prompt name",
+		promptIdentities(caps.Prompts),
+		existing.Prompts,
+		reservedPrompts,
+		"disable one server or expose unique prompt names",
+		true,
+	); err != nil {
+		return err
+	}
+	if err := validateCapabilityIdentityCollisions(
+		"resource URI",
+		resourceIdentities(caps.Resources),
+		existing.Resources,
+		nil,
+		"disable one server or expose unique resource URIs",
+		false,
+	); err != nil {
+		return err
+	}
+	if err := validateCapabilityIdentityCollisions(
+		"resource template URI template",
+		resourceTemplateIdentities(caps.ResourceTemplates),
+		existing.ResourceTemplates,
+		nil,
+		"disable one server or expose unique resource template URI templates",
+		false,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateCapabilityIdentityCollisions(kind string, registrations []capabilityIdentityRegistration, existing map[string]string, reserved map[string]struct{}, mitigation string, caseInsensitive bool) error {
+	seen := make(map[string]capabilityIdentityRegistration, len(registrations))
+
+	for _, registration := range sortedCapabilityIdentityRegistrations(registrations) {
+		if strings.TrimSpace(registration.identifier) == "" {
+			return capabilityNameCollisionError{message: fmt.Sprintf("%s collision: %s exposes an empty %s", kind, capabilityOwner(registration.serverName), kind)}
+		}
+
+		if _, ok := findIdentityMapEntry(reserved, registration.identifier, caseInsensitive); ok {
+			return capabilityNameCollisionError{message: fmt.Sprintf("%s collision: %s exposes reserved gateway %s %q; %s", kind, capabilityOwner(registration.serverName), kind, registration.identifier, mitigation)}
+		}
+
+		if previous, ok := findIdentityMapEntry(seen, registration.identifier, caseInsensitive); ok {
+			return capabilityNameCollisionError{message: fmt.Sprintf("%s collision: %s and %s both expose %s %q; %s", kind, capabilityOwner(previous.serverName), capabilityOwner(registration.serverName), kind, registration.identifier, mitigation)}
+		}
+		seen[registration.identifier] = registration
+
+		if existing == nil {
+			continue
+		}
+		if previousServerName, ok := findIdentityMapEntry(existing, registration.identifier, caseInsensitive); ok {
+			return capabilityNameCollisionError{message: fmt.Sprintf("%s collision: %s would shadow %s for %s %q; %s", kind, capabilityOwner(registration.serverName), capabilityOwner(previousServerName), kind, registration.identifier, mitigation)}
+		}
+	}
+
+	return nil
+}
+
+func findIdentityMapEntry[V any](entries map[string]V, candidate string, caseInsensitive bool) (V, bool) {
+	if caseInsensitive {
+		_, value, ok := findEqualFoldMapEntry(entries, candidate)
+		return value, ok
+	}
+	value, ok := entries[candidate]
+	return value, ok
+}
+
+func promptIdentities(registrations []PromptRegistration) []capabilityIdentityRegistration {
+	identities := make([]capabilityIdentityRegistration, 0, len(registrations))
+	for _, registration := range registrations {
+		if registration.Prompt == nil {
+			continue
+		}
+		identities = append(identities, capabilityIdentityRegistration{
+			serverName: registration.ServerName,
+			identifier: registration.Prompt.Name,
+		})
+	}
+	return identities
+}
+
+func resourceIdentities(registrations []ResourceRegistration) []capabilityIdentityRegistration {
+	identities := make([]capabilityIdentityRegistration, 0, len(registrations))
+	for _, registration := range registrations {
+		if registration.Resource == nil {
+			continue
+		}
+		identities = append(identities, capabilityIdentityRegistration{
+			serverName: registration.ServerName,
+			identifier: registration.Resource.URI,
+		})
+	}
+	return identities
+}
+
+func resourceTemplateIdentities(registrations []ResourceTemplateRegistration) []capabilityIdentityRegistration {
+	identities := make([]capabilityIdentityRegistration, 0, len(registrations))
+	for _, registration := range registrations {
+		identities = append(identities, capabilityIdentityRegistration{
+			serverName: registration.ServerName,
+			identifier: registration.ResourceTemplate.URITemplate,
+		})
+	}
+	return identities
+}
+
+func sortedCapabilityIdentityRegistrations(registrations []capabilityIdentityRegistration) []capabilityIdentityRegistration {
+	sorted := append([]capabilityIdentityRegistration(nil), registrations...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		left, right := sorted[i], sorted[j]
+		if left.serverName != right.serverName {
+			return left.serverName < right.serverName
+		}
+		return left.identifier < right.identifier
+	})
+	return sorted
+}
+
+func capabilityOwner(serverName string) string {
+	if serverName == "" {
+		return "gateway internal capabilities"
+	}
+	return fmt.Sprintf("server %q", serverName)
+}
+
+func (g *Gateway) addCatalogToolNameDiagnostics(serverInfo map[string]any, serverName string, server catalog.Server) {
+	warnings := g.catalogToolNameWarnings(serverName, server)
+	if len(warnings) > 0 {
+		serverInfo["tool_name_warnings"] = warnings
+	}
+}
+
+func (g *Gateway) catalogToolNameWarnings(serverName string, server catalog.Server) []string {
+	if len(server.Tools) == 0 {
+		return nil
+	}
+
+	prefix := server.Prefix
+	if prefix == "" && g.ToolNamePrefix {
+		prefix = serverName
+	}
+
+	g.capabilitiesMu.RLock()
+	existing := make(map[string]ToolRegistration, len(g.toolRegistrations))
+	for name, registration := range g.toolRegistrations {
+		existing[name] = registration
+	}
+	g.capabilitiesMu.RUnlock()
+
+	var warnings []string
+	seen := make(map[string]string, len(server.Tools))
+	for _, tool := range server.Tools {
+		toolName := strings.TrimSpace(tool.Name)
+		if toolName == "" {
+			warnings = append(warnings, "catalog metadata includes an empty tool name")
+			continue
+		}
+
+		exposedName := prefixToolName(prefix, toolName)
+		if previousExposedName, previousRawName, ok := findEqualFoldMapEntry(seen, exposedName); ok {
+			if previousExposedName == exposedName {
+				warnings = append(warnings, fmt.Sprintf("tool %q would be exposed as %q, which duplicates tool %q in this server", toolName, exposedName, previousRawName))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("tool %q would be exposed as %q, which differs only by case from tool %q exposed as %q in this server", toolName, exposedName, previousRawName, previousExposedName))
+			}
+			continue
+		}
+		seen[exposedName] = toolName
+
+		if reservedName, _, reserved := findEqualFoldMapEntry(reservedGatewayToolNames, exposedName); reserved {
+			if reservedName == exposedName {
+				warnings = append(warnings, fmt.Sprintf("tool %q would be exposed as %q, which is reserved for a gateway internal tool", toolName, exposedName))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("tool %q would be exposed as %q, which differs only by case from reserved gateway internal tool %q", toolName, exposedName, reservedName))
+			}
+			continue
+		}
+
+		if previousName, previous, ok := findEqualFoldMapEntry(existing, exposedName); ok && previous.ServerName != serverName {
+			if previousName == exposedName {
+				warnings = append(warnings, fmt.Sprintf("tool %q would be exposed as %q, which conflicts with %s", toolName, exposedName, toolOwner(previous)))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("tool %q would be exposed as %q, which differs only by case from %s tool name %q", toolName, exposedName, toolOwner(previous), previousName))
+			}
+		}
+	}
+
+	sort.Strings(warnings)
+	return warnings
+}

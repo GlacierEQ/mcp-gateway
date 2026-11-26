@@ -2,11 +2,12 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strings"
-	"sync"
+	"net/url"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -19,15 +20,26 @@ func (g *Gateway) startStdioServer(ctx context.Context, _ io.Reader, _ io.Writer
 }
 
 func (g *Gateway) startSseServer(ctx context.Context, ln net.Listener) error {
+	if g.authToken == "" && !g.AllowUnauthenticated {
+		return errors.New("authentication token is required for SSE transport")
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/health", healthHandler(&g.health))
 	mux.Handle("/", redirectHandler("/sse"))
 	sseHandler := mcp.NewSSEHandler(func(_ *http.Request) *mcp.Server {
 		return g.mcpServer
 	}, nil)
-	mux.Handle("/sse", sseHandler)
+	mux.Handle("/sse", originSecurityHandler(sseHandler))
+
+	// Wrap with authentication middleware
+	var handler http.Handler = mux
+	if g.authToken != "" {
+		handler = authenticationMiddleware(g.authToken, mux)
+	}
+
 	httpServer := &http.Server{
-		Handler: mux,
+		Handler: handler,
 	}
 	go func() {
 		<-ctx.Done()
@@ -37,15 +49,26 @@ func (g *Gateway) startSseServer(ctx context.Context, ln net.Listener) error {
 }
 
 func (g *Gateway) startStreamingServer(ctx context.Context, ln net.Listener) error {
+	if g.authToken == "" && !g.AllowUnauthenticated {
+		return errors.New("authentication token is required for streaming transport")
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/health", healthHandler(&g.health))
 	mux.Handle("/", redirectHandler("/mcp"))
 	streamHandler := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return g.mcpServer
 	}, nil)
-	mux.Handle("/mcp", streamHandler)
+	mux.Handle("/mcp", originSecurityHandler(streamHandler))
+
+	// Wrap with authentication middleware
+	var handler http.Handler = mux
+	if g.authToken != "" {
+		handler = authenticationMiddleware(g.authToken, mux)
+	}
+
 	httpServer := &http.Server{
-		Handler: mux,
+		Handler: handler,
 	}
 
 	go func() {
@@ -53,65 +76,6 @@ func (g *Gateway) startStreamingServer(ctx context.Context, ln net.Listener) err
 		ln.Close()
 	}()
 	return httpServer.Serve(ln)
-}
-
-func (g *Gateway) startCentralStreamingServer(ctx context.Context, ln net.Listener, configuration Configuration) error {
-	mux := http.NewServeMux()
-	mux.Handle("/health", healthHandler(&g.health))
-	mux.Handle("/", redirectHandler("/mcp"))
-
-	var lock sync.Mutex
-	handlersPerSelectionOfServers := map[string]*mcp.StreamableHTTPHandler{}
-	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
-		serverNames := r.Header.Get("x-mcp-servers")
-		if len(serverNames) == 0 {
-			log("No server names provided in the request header 'x-mcp-servers'")
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = io.WriteString(w, "No server names provided in the request header 'x-mcp-servers'")
-			return
-		}
-
-		lock.Lock()
-		handler := handlersPerSelectionOfServers[serverNames]
-		if handler == nil {
-			if err := g.reloadConfiguration(ctx, configuration, parseServerNames(serverNames), nil); err != nil {
-				lock.Unlock()
-				w.WriteHeader(http.StatusInternalServerError)
-				_, _ = io.WriteString(w, "Failed to reload configuration")
-				return
-			}
-			handler = mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
-				return g.mcpServer
-			}, nil)
-			handlersPerSelectionOfServers[serverNames] = handler
-		}
-		lock.Unlock()
-
-		handler.ServeHTTP(w, r)
-	})
-	httpServer := &http.Server{
-		Handler: mux,
-	}
-
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-	g.health.SetHealthy()
-	return httpServer.Serve(ln)
-}
-
-func parseServerNames(serverNames string) []string {
-	var names []string
-	for name := range strings.SplitSeq(serverNames, ",") {
-		name := strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-
-		names = append(names, name)
-	}
-	return names
 }
 
 func redirectHandler(target string) http.HandlerFunc {
@@ -128,4 +92,43 @@ func healthHandler(state *health.State) http.HandlerFunc {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 	}
+}
+
+// isAllowedOrigin validates that the origin is from localhost.
+// Returns true if the origin's hostname is "localhost", "127.0.0.1", or "::1" (IPv6 localhost).
+func isAllowedOrigin(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false // Invalid URL format
+	}
+
+	// Only allow http or https schemes
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+
+	// Extract hostname (without port)
+	host := u.Hostname()
+
+	// Only allow localhost, IPv4 loopback, or IPv6 loopback
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+// originSecurityHandler validates Origin header to prevent DNS rebinding attacks.
+func originSecurityHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// Allow requests with no Origin header
+		// This handles:
+		// - Non-browser clients (curl, SDKs) - no Origin header sent
+		// - Same-origin requests - browsers don't send Origin for same-origin
+		if origin != "" && !isAllowedOrigin(origin) {
+			msg := fmt.Sprintf("Forbidden: Origin, if set, must be localhost, 127.0.0.1, or ::1, got: %s", origin)
+			http.Error(w, msg, http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }

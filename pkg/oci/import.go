@@ -13,6 +13,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/docker/mcp-gateway/pkg/catalog"
+	"github.com/docker/mcp-gateway/pkg/desktop"
 )
 
 func ImportToServer(registryURL string) (catalog.Server, error) {
@@ -22,7 +23,8 @@ func ImportToServer(registryURL string) (catalog.Server, error) {
 
 	// Fetch JSON document from registryUrl
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Transport: desktop.ProxyTransport(),
+		Timeout:   30 * time.Second,
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, registryURL, nil)
@@ -64,7 +66,8 @@ func Import(registryURL string, ociRepository string, push bool) error {
 
 	// Fetch JSON document from registryUrl
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Transport: desktop.ProxyTransport(),
+		Timeout:   30 * time.Second,
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, registryURL, nil)
@@ -163,7 +166,7 @@ func Import(registryURL string, ociRepository string, push bool) error {
 	firstRef := ociReferences[0]
 
 	// Verify the reference can be resolved
-	subjectDescriptor, err := remote.Get(firstRef, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	subjectDescriptor, err := remote.Get(firstRef, remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithTransport(desktop.ProxyTransport()))
 	if err != nil {
 		return fmt.Errorf("failed to resolve reference %s: %w", firstRef.Name(), err)
 	}
@@ -191,13 +194,17 @@ func Import(registryURL string, ociRepository string, push bool) error {
 		Registry: []Server{server},
 	}
 
-	// Create the OCI artifact with the subject
-	manifest, err := CreateArtifactWithSubjectAndPush(artifactRef, ociCatalog, subjectDescriptor.Digest, subjectDescriptor.Size, subjectDescriptor.MediaType, push)
-	if err != nil {
-		return fmt.Errorf("failed to create OCI artifact: %w", err)
-	}
+	if push {
+		// Create the OCI artifact with the subject
+		manifest, err := CreateArtifactWithSubjectAndPush(context.Background(), artifactRef, ociCatalog, subjectDescriptor.Digest, subjectDescriptor.Size, subjectDescriptor.MediaType)
+		if err != nil {
+			return fmt.Errorf("failed to create OCI artifact: %w", err)
+		}
 
-	fmt.Printf("%s@sha256:%s", artifactRef.Context().Name(), manifest)
+		fmt.Printf("%s@sha256:%s", artifactRef.Context().Name(), manifest)
+	} else {
+		fmt.Printf("Artifact not pushed")
+	}
 
 	return nil
 }

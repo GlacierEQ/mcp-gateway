@@ -7,10 +7,12 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/config/configfile"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/mcp-gateway/pkg/features"
 )
 
 // featureCommand creates the `feature` command and its subcommands
-func featureCommand(dockerCli command.Cli) *cobra.Command {
+func featureCommand(dockerCli command.Cli, features features.Features) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "feature",
 		Short: "Manage experimental features",
@@ -21,16 +23,16 @@ and control optional functionality that may change in future versions.`,
 	}
 
 	cmd.AddCommand(
-		featureEnableCommand(dockerCli),
-		featureDisableCommand(dockerCli),
-		featureListCommand(dockerCli),
+		featureEnableCommand(dockerCli, features),
+		featureDisableCommand(dockerCli, features),
+		featureListCommand(dockerCli, features),
 	)
 
 	return cmd
 }
 
 // featureEnableCommand creates the `feature enable` command
-func featureEnableCommand(dockerCli command.Cli) *cobra.Command {
+func featureEnableCommand(dockerCli command.Cli, features features.Features) *cobra.Command {
 	return &cobra.Command{
 		Use:   "enable <feature-name>",
 		Short: "Enable an experimental feature",
@@ -39,14 +41,16 @@ func featureEnableCommand(dockerCli command.Cli) *cobra.Command {
 Available features:
   oauth-interceptor      Enable GitHub OAuth flow interception for automatic authentication
   mcp-oauth-dcr          Enable Dynamic Client Registration (DCR) for automatic OAuth client setup
-  dynamic-tools          Enable internal MCP management tools (mcp-find, mcp-add, mcp-remove)`,
+  dynamic-tools          Enable internal MCP management tools (mcp-find, mcp-add, mcp-remove)
+	` + notDockerDesktop(features, `profiles               Enable profile management (docker mcp profile <subcommand>)
+  `) + `tool-name-prefix       Prefix all tool names with server name to avoid conflicts`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			featureName := args[0]
 
 			// Validate feature name
-			if !isKnownFeature(featureName) {
-				return fmt.Errorf("unknown feature: %s\n\nAvailable features:\n  oauth-interceptor      Enable GitHub OAuth flow interception\n  mcp-oauth-dcr          Enable Dynamic Client Registration for automatic OAuth setup\n  dynamic-tools          Enable internal MCP management tools", featureName)
+			if !isKnownFeature(featureName, features) {
+				return fmt.Errorf("unknown feature: %s\n\nAvailable features:\n  oauth-interceptor      Enable GitHub OAuth flow interception\n  mcp-oauth-dcr          Enable Dynamic Client Registration for automatic OAuth setup\n  dynamic-tools          Enable internal MCP management tools\n"+notDockerDesktop(features, "  profiles               Enable profile management (docker mcp profile <subcommand>)\n")+"  tool-name-prefix       Prefix all tool names with server name", featureName)
 			}
 
 			// Enable the feature
@@ -83,6 +87,18 @@ Available features:
 				fmt.Println("  - mcp-add: add MCP servers to the registry and reload configuration")
 				fmt.Println("  - mcp-remove: remove MCP servers from the registry and reload configuration")
 				fmt.Println("\nNo additional flags are needed - this applies to all gateway runs.")
+			case "profiles":
+				fmt.Println("\nThis feature enables profile management tools.")
+				fmt.Println("When enabled, the cli provides commands for managing profiles:")
+				fmt.Println("  - docker mcp profile <subcommand> ...")
+				fmt.Println("\nThis also enables the --profile flag for the docker mcp gateway run command.")
+			case "tool-name-prefix":
+				fmt.Println("\nThis feature enables automatic prefixing of tool names with server names.")
+				fmt.Println("When enabled, all tools are automatically prefixed with their server name:")
+				fmt.Println("  - Example: 'search' becomes 'github:search'")
+				fmt.Println("  - Prevents name conflicts when multiple servers provide tools with the same name")
+				fmt.Println("  - Individual servers can override this with the 'prefix' field in their configuration")
+				fmt.Println("\nNo additional flags are needed - this applies to all gateway runs.")
 			}
 
 			return nil
@@ -91,7 +107,7 @@ Available features:
 }
 
 // featureDisableCommand creates the `feature disable` command
-func featureDisableCommand(dockerCli command.Cli) *cobra.Command {
+func featureDisableCommand(dockerCli command.Cli, features features.Features) *cobra.Command {
 	return &cobra.Command{
 		Use:   "disable <feature-name>",
 		Short: "Disable an experimental feature",
@@ -101,7 +117,7 @@ func featureDisableCommand(dockerCli command.Cli) *cobra.Command {
 			featureName := args[0]
 
 			// Validate feature name
-			if !isKnownFeature(featureName) {
+			if !isKnownFeature(featureName, features) {
 				return fmt.Errorf("unknown feature: %s", featureName)
 			}
 
@@ -124,7 +140,7 @@ func featureDisableCommand(dockerCli command.Cli) *cobra.Command {
 }
 
 // featureListCommand creates the `feature list` command
-func featureListCommand(dockerCli command.Cli) *cobra.Command {
+func featureListCommand(dockerCli command.Cli, features features.Features) *cobra.Command {
 	return &cobra.Command{
 		Use:     "ls",
 		Aliases: []string{"list"},
@@ -137,7 +153,10 @@ func featureListCommand(dockerCli command.Cli) *cobra.Command {
 			fmt.Println()
 
 			// Show all known features
-			knownFeatures := []string{"oauth-interceptor", "mcp-oauth-dcr", "dynamic-tools"}
+			knownFeatures := []string{"oauth-interceptor", "mcp-oauth-dcr", "dynamic-tools", "tool-name-prefix", "use-embeddings"}
+			if !features.IsRunningInDockerDesktop() {
+				knownFeatures = append(knownFeatures, "profiles")
+			}
 			for _, feature := range knownFeatures {
 				status := "disabled"
 				if isFeatureEnabledFromCli(dockerCli, feature) {
@@ -154,6 +173,12 @@ func featureListCommand(dockerCli command.Cli) *cobra.Command {
 					fmt.Printf("  %-20s %s\n", "", "Enable Dynamic Client Registration (DCR) for automatic OAuth client setup")
 				case "dynamic-tools":
 					fmt.Printf("  %-20s %s\n", "", "Enable internal MCP management tools (mcp-find, mcp-add, mcp-remove)")
+				case "profiles":
+					fmt.Printf("  %-20s %s\n", "", "Enable profile management tools (docker mcp profile <subcommand>)")
+				case "tool-name-prefix":
+					fmt.Printf("  %-20s %s\n", "", "Prefix all tool names with server name to avoid conflicts")
+				case "use-embeddings":
+					fmt.Printf("  %-20s %s\n", "", "Enable vector similarity search for find-tools (requires OPENAI_API_KEY)")
 				}
 				fmt.Println()
 			}
@@ -162,7 +187,7 @@ func featureListCommand(dockerCli command.Cli) *cobra.Command {
 			if configFile.Features != nil {
 				unknownFeatures := make([]string, 0)
 				for feature := range configFile.Features {
-					if !isKnownFeature(feature) {
+					if !isKnownFeature(feature, features) {
 						unknownFeatures = append(unknownFeatures, feature)
 					}
 				}
@@ -189,13 +214,19 @@ func isFeatureEnabledFromCli(dockerCli command.Cli, feature string) bool {
 
 // isFeatureEnabledFromConfig checks if a feature is enabled from a config file
 func isFeatureEnabledFromConfig(configFile *configfile.ConfigFile, feature string) bool {
+	// Features that are enabled by default
+	defaultEnabledFeatures := map[string]bool{
+		"mcp-oauth-dcr": true,
+		"dynamic-tools": true,
+	}
+
 	if configFile.Features == nil {
-		return false
+		return defaultEnabledFeatures[feature]
 	}
 
 	value, exists := configFile.Features[feature]
 	if !exists {
-		return false
+		return defaultEnabledFeatures[feature]
 	}
 
 	// Handle both boolean string values and "enabled"/"disabled" strings
@@ -212,11 +243,16 @@ func isFeatureEnabledFromConfig(configFile *configfile.ConfigFile, feature strin
 }
 
 // isKnownFeature checks if the feature name is valid
-func isKnownFeature(feature string) bool {
+func isKnownFeature(feature string, features features.Features) bool {
 	knownFeatures := []string{
 		"oauth-interceptor",
 		"mcp-oauth-dcr",
 		"dynamic-tools",
+		"tool-name-prefix",
+		"use-embeddings",
+	}
+	if !features.IsRunningInDockerDesktop() {
+		knownFeatures = append(knownFeatures, "profiles")
 	}
 
 	for _, known := range knownFeatures {
@@ -225,4 +261,11 @@ func isKnownFeature(feature string) bool {
 		}
 	}
 	return false
+}
+
+func notDockerDesktop(features features.Features, msg string) string {
+	if features.IsRunningInDockerDesktop() {
+		return ""
+	}
+	return msg
 }

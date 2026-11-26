@@ -1,125 +1,204 @@
+// This package stores secrets in the local OS Keychain.
 package secret
 
 import (
+	"bufio"
+	"bytes"
 	"context"
-	"io"
+	"fmt"
 	"os/exec"
 	"strings"
 
-	"github.com/docker/docker-credential-helpers/client"
-	"github.com/docker/docker-credential-helpers/credentials"
-
-	"github.com/docker/mcp-gateway/pkg/desktop"
+	"github.com/docker/secrets-engine/client"
+	"github.com/docker/secrets-engine/client/realms"
 )
 
-type CredStoreProvider struct {
-	credentialHelper credentials.Helper
+type CredStoreProvider struct{}
+
+func cmd(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "docker", append([]string{"pass"}, args...)...)
 }
 
-func NewCredStoreProvider() *CredStoreProvider {
-	return &CredStoreProvider{credentialHelper: GetHelper()}
+// realmPrefix returns the fixed prefix of a realm pattern by dropping its
+// trailing `**` wildcard (e.g. "docker/mcp/oauth/**" => "docker/mcp/oauth/").
+func realmPrefix(realm client.Pattern) string {
+	return strings.TrimSuffix(realm.String(), "**")
 }
 
-func getSecretKey(secretName string) string {
-	return "sm_" + secretName
+// GetDefaultSecretKey returns the full ID for an MCP secret in the default realm
+// (docker/mcp/**), e.g. "postgres_password" => "docker/mcp/postgres_password".
+func GetDefaultSecretKey(name client.ID) (client.ID, error) {
+	return realms.DockerMCPDefault.ExpandID(name)
 }
 
-func (store *CredStoreProvider) GetSecret(id string) (string, error) {
-	_, val, err := store.credentialHelper.Get(getSecretKey(id))
+// GetOAuthKey returns the full ID for an OAuth token (docker/mcp/oauth/**).
+func GetOAuthKey(provider client.ID) (client.ID, error) {
+	return realms.DockerMCPOAuth.ExpandID(provider)
+}
+
+// GetDCRKey returns the full ID for a DCR client config (docker/mcp/oauth-dcr/**).
+func GetDCRKey(serverName client.ID) (client.ID, error) {
+	return realms.DockerMCPOAuthDCR.ExpandID(serverName)
+}
+
+// StripNamespace removes the realm prefix from a secret ID to get the simple name.
+// OAuth and DCR realms must be stripped first (more specific), then default.
+func StripNamespace(secretID string) string {
+	name := strings.TrimPrefix(secretID, realmPrefix(realms.DockerMCPOAuth))
+	name = strings.TrimPrefix(name, realmPrefix(realms.DockerMCPOAuthDCR))
+	name = strings.TrimPrefix(name, realmPrefix(realms.DockerMCPDefault))
+	return name
+}
+
+// List returns the IDs of all secrets stored in the local OS Keychain.
+// Stored keys that are not valid secret IDs are skipped.
+func List(ctx context.Context) ([]client.ID, error) {
+	c := cmd(ctx, "ls")
+	out, err := c.Output()
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("could not list secrets: %s\n%s", bytes.TrimSpace(out), err)
 	}
-	return val, nil
-}
-
-func (store *CredStoreProvider) SetSecret(id string, value string) error {
-	return store.credentialHelper.Add(&credentials.Credentials{
-		ServerURL: getSecretKey(id),
-		Username:  "mcp",
-		Secret:    value,
-	})
-}
-
-func (store *CredStoreProvider) DeleteSecret(id string) error {
-	return store.credentialHelper.Delete(getSecretKey(id))
-}
-
-func GetHelper() credentials.Helper {
-	credentialHelperPath := desktop.Paths().CredentialHelperPath()
-	return Helper{
-		program: newShellProgramFunc(credentialHelperPath),
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	var secrets []client.ID
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 {
+			continue
+		}
+		id, err := client.ParseID(line)
+		if err != nil {
+			continue
+		}
+		secrets = append(secrets, id)
 	}
+	return secrets, nil
 }
 
-// newShellProgramFunc creates programs that are executed in a Shell.
-func newShellProgramFunc(name string) client.ProgramFunc {
-	return func(args ...string) client.Program {
-		return &shell{cmd: exec.CommandContext(context.Background(), name, args...)}
-	}
-}
-
-// shell invokes shell commands to talk with a remote credentials-helper.
-type shell struct {
-	cmd *exec.Cmd
-}
-
-// Output returns responses from the remote credentials-helper.
-func (s *shell) Output() ([]byte, error) {
-	return s.cmd.Output()
-}
-
-// Input sets the input to send to a remote credentials-helper.
-func (s *shell) Input(in io.Reader) {
-	s.cmd.Stdin = in
-}
-
-// Helper wraps credential helper program.
-type Helper struct {
-	// name    string
-	program client.ProgramFunc
-}
-
-func (h Helper) List() (map[string]string, error) {
-	return map[string]string{}, nil
-}
-
-// Add stores new credentials.
-func (h Helper) Add(creds *credentials.Credentials) error {
-	username, secret, err := h.Get(creds.ServerURL)
-	if err != nil && !credentials.IsErrCredentialsNotFound(err) && !isErrDecryption(err) {
+// setDefaultSecret stores a secret in the default realm (docker/mcp/**).
+func setDefaultSecret(ctx context.Context, id client.ID, value string) error {
+	key, err := GetDefaultSecretKey(id)
+	if err != nil {
 		return err
 	}
-	if username == creds.Username && secret == creds.Secret {
-		return nil
-	}
-	if err := client.Store(h.program, creds); err != nil {
-		return err
+	c := cmd(ctx, "set", key.String())
+	c.Stdin = strings.NewReader(value)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not store secret: %s\n%s", bytes.TrimSpace(out), err)
 	}
 	return nil
 }
 
-// Delete removes credentials.
-func (h Helper) Delete(serverURL string) error {
-	if _, _, err := h.Get(serverURL); err != nil {
-		if credentials.IsErrCredentialsNotFound(err) {
-			return nil
-		}
+// DeleteByID removes a secret from docker pass by its full ID, without any realm expansion.
+func DeleteByID(ctx context.Context, id client.ID) error {
+	out, err := cmd(ctx, "rm", id.String()).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not delete secret: %s\n%s\n%s", id.String(), bytes.TrimSpace(out), err)
+	}
+	return nil
+}
+
+// DeleteDefaultSecret removes a secret from the default realm (docker/mcp/**).
+func DeleteDefaultSecret(ctx context.Context, id client.ID) error {
+	key, err := GetDefaultSecretKey(id)
+	if err != nil {
 		return err
 	}
-	return client.Erase(h.program, serverURL)
-}
-
-// Get returns the username and secret to use for a given registry server URL.
-func (h Helper) Get(serverURL string) (string, string, error) {
-	creds, err := client.Get(h.program, serverURL)
+	out, err := cmd(ctx, "rm", key.String()).CombinedOutput()
 	if err != nil {
-		return "", "", err
+		return fmt.Errorf("could not delete secret: %s\n%s\n%s", id.String(), bytes.TrimSpace(out), err)
 	}
-	return creds.Username, creds.Secret, nil
+	return nil
 }
 
-func isErrDecryption(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "gpg: decryption failed: No secret key")
+// SetOAuthToken stores an OAuth token via docker pass at docker/mcp/oauth/{serverID}.
+// The value should be base64-encoded JSON of the full oauth2.Token.
+func SetOAuthToken(ctx context.Context, serverID client.ID, value string) error {
+	keyID, err := GetOAuthKey(serverID)
+	if err != nil {
+		return err
+	}
+	key := keyID.String()
+
+	keys, err := List(ctx)
+	if err != nil {
+		return fmt.Errorf("could not check existing OAuth token for %s: %w", serverID.String(), err)
+	}
+
+	// docker pass set is insert-only, so if the key already exists we need to remove it first.
+	for _, k := range keys {
+		if k == keyID {
+			if out, err := cmd(ctx, "rm", key).CombinedOutput(); err != nil {
+				return fmt.Errorf("could not remove existing OAuth token for %s: %s\n%s", serverID.String(), bytes.TrimSpace(out), err)
+			}
+			break
+		}
+	}
+
+	c := cmd(ctx, "set", key)
+	c.Stdin = strings.NewReader(value)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not store OAuth token for %s: %s\n%s", serverID.String(), bytes.TrimSpace(out), err)
+	}
+	return nil
 }
 
-var _ credentials.Helper = Helper{}
+// DeleteOAuthToken removes an OAuth token from docker pass.
+func DeleteOAuthToken(ctx context.Context, serverID client.ID) error {
+	keyID, err := GetOAuthKey(serverID)
+	if err != nil {
+		return err
+	}
+	out, err := cmd(ctx, "rm", keyID.String()).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not delete OAuth token for %s: %s\n%s", serverID.String(), bytes.TrimSpace(out), err)
+	}
+	return nil
+}
+
+// SetDCRClient stores a DCR client config via docker pass at docker/mcp/oauth-dcr/{serverID}.
+// The value should be base64-encoded JSON of the DCR client.
+func SetDCRClient(ctx context.Context, serverID client.ID, value string) error {
+	keyID, err := GetDCRKey(serverID)
+	if err != nil {
+		return err
+	}
+	key := keyID.String()
+
+	keys, err := List(ctx)
+	if err != nil {
+		return fmt.Errorf("could not check existing DCR client for %s: %w", serverID.String(), err)
+	}
+
+	// docker pass set is insert-only, so if the key already exists we need to remove it first.
+	for _, k := range keys {
+		if k == keyID {
+			if out, err := cmd(ctx, "rm", key).CombinedOutput(); err != nil {
+				return fmt.Errorf("could not remove existing DCR client for %s: %s\n%s", serverID.String(), bytes.TrimSpace(out), err)
+			}
+			break
+		}
+	}
+
+	c := cmd(ctx, "set", key)
+	c.Stdin = strings.NewReader(value)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not store DCR client for %s: %s\n%s", serverID.String(), bytes.TrimSpace(out), err)
+	}
+	return nil
+}
+
+// DeleteDCRClient removes a DCR client config from docker pass.
+func DeleteDCRClient(ctx context.Context, serverID client.ID) error {
+	keyID, err := GetDCRKey(serverID)
+	if err != nil {
+		return err
+	}
+	out, err := cmd(ctx, "rm", keyID.String()).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("could not delete DCR client for %s: %s\n%s", serverID.String(), bytes.TrimSpace(out), err)
+	}
+	return nil
+}

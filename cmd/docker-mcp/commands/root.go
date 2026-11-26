@@ -2,15 +2,20 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"slices"
 
 	"github.com/docker/cli/cli-plugins/plugin"
 	"github.com/docker/cli/cli/command"
 	"github.com/spf13/cobra"
 
 	"github.com/docker/mcp-gateway/cmd/docker-mcp/version"
+	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/desktop"
 	"github.com/docker/mcp-gateway/pkg/docker"
+	"github.com/docker/mcp-gateway/pkg/features"
+	"github.com/docker/mcp-gateway/pkg/migrate"
 )
 
 // Note: We use a custom help template to make it more brief.
@@ -30,7 +35,9 @@ Examples:
 `
 
 // Root returns the root command for the init plugin
-func Root(ctx context.Context, cwd string, dockerCli command.Cli) *cobra.Command {
+func Root(ctx context.Context, cwd string, dockerCli command.Cli, features features.Features) *cobra.Command {
+	dockerClient := docker.NewClient(dockerCli)
+
 	cmd := &cobra.Command{
 		Use:              "mcp [OPTIONS]",
 		Short:            "Manage MCP servers and clients",
@@ -45,7 +52,30 @@ func Root(ctx context.Context, cwd string, dockerCli command.Cli) *cobra.Command
 				return err
 			}
 
+			// Check the feature initialization error here for clearer error messages for the user
+			if features.InitError() != nil {
+				return features.InitError()
+			}
+
+			// Note: Using PersistentPreRunE in secretCommand would override this parent hook
+			if isSubcommandOf(cmd, []string{"secret"}) {
+				if err := desktop.CheckHasDockerPass(cmd.Context()); err != nil {
+					return err
+				}
+			}
+
 			if os.Getenv("DOCKER_MCP_IN_CONTAINER") != "1" {
+				if features.IsProfilesFeatureEnabled() {
+					if isSubcommandOf(cmd, []string{"catalog-next", "catalog", "catalogs", "profile", "template"}) {
+						dao, err := db.New()
+						if err != nil {
+							return err
+						}
+						defer dao.Close()
+						migrate.MigrateConfig(cmd.Context(), dockerClient, dao)
+					}
+				}
+
 				runningInDockerCE, err := docker.RunningInDockerCE(ctx, dockerCli)
 				if err != nil {
 					return err
@@ -68,20 +98,23 @@ func Root(ctx context.Context, cwd string, dockerCli command.Cli) *cobra.Command
 		return []string{"--help"}, cobra.ShellCompDirectiveNoFileComp
 	})
 
-	dockerClient := docker.NewClient(dockerCli)
-
-	cmd.AddCommand(workingSetCommand())
-	cmd.AddCommand(catalogCommand(dockerCli))
-	cmd.AddCommand(clientCommand(cwd))
-	cmd.AddCommand(configCommand(dockerClient))
-	cmd.AddCommand(featureCommand(dockerCli))
-	cmd.AddCommand(gatewayCommand(dockerClient, dockerCli))
+	if features.IsProfilesFeatureEnabled() {
+		cmd.AddCommand(workingSetCommand(cwd))
+		cmd.AddCommand(templateCommand())
+		cmd.AddCommand(catalogNextCommand())
+		cmd.AddCommand(obsoleteCommand("config", "See `docker mcp profile config --help` instead."))
+	} else {
+		cmd.AddCommand(catalogCommand(dockerCli))
+		cmd.AddCommand(configCommand(dockerClient))
+	}
+	cmd.AddCommand(clientCommand(dockerCli, cwd, features))
+	cmd.AddCommand(featureCommand(dockerCli, features))
+	cmd.AddCommand(gatewayCommand(dockerClient, dockerCli, features))
 	cmd.AddCommand(oauthCommand())
-	cmd.AddCommand(policyCommand())
 	cmd.AddCommand(registryCommand())
-	cmd.AddCommand(secretCommand(dockerClient))
-	cmd.AddCommand(serverCommand(dockerClient, dockerCli))
-	cmd.AddCommand(toolsCommand(dockerClient))
+	cmd.AddCommand(secretCommand())
+	cmd.AddCommand(serverCommand(dockerClient, dockerCli, features))
+	cmd.AddCommand(toolsCommand(dockerClient, dockerCli, features))
 	cmd.AddCommand(versionCommand())
 
 	if os.Getenv("DOCKER_MCP_SHOW_HIDDEN") == "1" {
@@ -96,5 +129,29 @@ func unhideHiddenCommands(cmd *cobra.Command) {
 	for _, c := range cmd.Commands() {
 		c.Hidden = false
 		unhideHiddenCommands(c)
+	}
+}
+
+func isSubcommandOf(cmd *cobra.Command, names []string) bool {
+	if cmd == nil {
+		return false
+	}
+
+	if slices.Contains(names, cmd.Name()) {
+		return true
+	}
+
+	return isSubcommandOf(cmd.Parent(), names)
+}
+
+func obsoleteCommand(name string, message string) *cobra.Command {
+	return &cobra.Command{
+		Use:                name,
+		Short:              "Obsolete",
+		Hidden:             true,
+		DisableFlagParsing: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return fmt.Errorf("This command is obsolete. %s", message) //nolint:staticcheck
+		},
 	}
 }

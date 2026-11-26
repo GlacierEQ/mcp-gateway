@@ -11,10 +11,11 @@ import (
 	"github.com/docker/docker/api/types/network"
 
 	"github.com/docker/mcp-gateway/pkg/docker"
+	"github.com/docker/mcp-gateway/pkg/log"
 	"github.com/docker/mcp-gateway/pkg/sliceutil"
 )
 
-const l7Image = "docker/mcp-l7proxy:v1@sha256:ef8fd775fdf8ad060af897018c0db3c52229c493cfde437e86c754f3fcd59233"
+const l7Image = "docker/mcp-l7proxy:v1@sha256:f4b5fdcec8a80fb6769e513e68877ee739553a1ee3b41648d98c89d2c0fb41f5"
 
 // runL7Proxy starts a single L7 proxy for all the allowed hosts. It returns
 // the proxy container name and a list of links to add to the MCP tool.
@@ -37,7 +38,7 @@ func runL7Proxy(ctx context.Context, cli docker.Client, target *TargetConfig, ex
 	})...)
 	target.Env = append(target.Env, "http_proxy="+proxyName+":8080", "https_proxy="+proxyName+":8080")
 
-	logf("    - Starting l7 proxy %s for %s", proxyName, allowedHosts)
+	log.Logf("    - Starting l7 proxy %s for %s", proxyName, allowedHosts)
 
 	err := cli.StartContainer(ctx, proxyName,
 		container.Config{

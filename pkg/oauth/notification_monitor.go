@@ -8,9 +8,9 @@ import (
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/docker/mcp-gateway/pkg/desktop"
+	"github.com/docker/mcp-gateway/pkg/log"
 )
 
 // EventType represents the type of OAuth event from Docker Desktop
@@ -63,33 +63,19 @@ func (m *NotificationMonitor) Start(ctx context.Context) {
 	go m.monitor(ctx)
 }
 
-// monitor runs the main monitoring loop with automatic reconnection
+// monitor connects once to the OAuth notification stream.
+// If the connection fails or is lost, it does not retry.
 func (m *NotificationMonitor) monitor(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			log("- OAuth notification monitor shutting down")
-			return
-		default:
-			m.connect(ctx)
-			// Reconnect after 5 seconds on disconnect
-			select {
-			case <-time.After(5 * time.Second):
-				log("- OAuth notification monitor reconnecting...")
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
+	m.connect(ctx)
 }
 
 // connect establishes SSE connection and processes events
 func (m *NotificationMonitor) connect(ctx context.Context) {
-	logf("- Connecting to OAuth notification stream at %s", m.url)
+	log.Logf("- Connecting to OAuth notification stream at %s", m.url)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.url, nil)
 	if err != nil {
-		logf("- Failed to create OAuth notification request: %v", err)
+		log.Logf("- Failed to create OAuth notification request: %v", err)
 		return
 	}
 
@@ -99,23 +85,23 @@ func (m *NotificationMonitor) connect(ctx context.Context) {
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		logf("- Failed to connect to OAuth notifications: %v", err)
+		log.Logf("- Failed to connect to OAuth notifications: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		logf("- OAuth notification stream unexpected status: %d %s", resp.StatusCode, resp.Status)
+		log.Logf("- OAuth notification stream unexpected status: %d %s", resp.StatusCode, resp.Status)
 		return
 	}
 
-	log("- OAuth notification stream connected")
+	log.Log("- OAuth notification stream connected")
 
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
-			log("- OAuth notification stream stopping")
+			log.Log("- OAuth notification stream stopping")
 			return
 		default:
 		}
@@ -136,7 +122,7 @@ func (m *NotificationMonitor) connect(ctx context.Context) {
 
 			oauthEvent, err := parseOAuthEvent(jsonData)
 			if err != nil {
-				logf("- Failed to parse OAuth event: %v", err)
+				log.Logf("- Failed to parse OAuth event: %v", err)
 				continue
 			}
 
@@ -145,9 +131,9 @@ func (m *NotificationMonitor) connect(ctx context.Context) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		logf("- OAuth notification connection error: %v", err)
+		log.Logf("- OAuth notification connection error: %v", err)
 	} else {
-		log("- OAuth notification stream closed")
+		log.Log("- OAuth notification stream closed")
 	}
 }
 
@@ -192,7 +178,7 @@ func parseOAuthEvent(jsonData string) (Event, error) {
 
 // processOAuthEvent calls callback for relevant events and logs errors
 func (m *NotificationMonitor) processOAuthEvent(event Event) {
-	logf("- SSE event received: %s for %s", event.Type, event.Provider)
+	log.Logf("- SSE event received: %s for %s", event.Type, event.Provider)
 
 	// Only log errors and unknown events - let handleOAuthEvent handle success logs
 	switch event.Type {
@@ -205,12 +191,12 @@ func (m *NotificationMonitor) processOAuthEvent(event Event) {
 		}
 	case EventError:
 		if event.Error != "" {
-			logf("- OAuth error for %s: %s", event.Provider, event.Error)
+			log.Logf("- OAuth error for %s: %s", event.Provider, event.Error)
 		} else {
-			logf("- OAuth error for %s (no details)", event.Provider)
+			log.Logf("- OAuth error for %s (no details)", event.Provider)
 		}
 	default:
-		logf("- Unknown OAuth event type: %s for %s", event.Type, event.Provider)
+		log.Logf("- Unknown OAuth event type: %s for %s", event.Type, event.Provider)
 	}
 }
 

@@ -63,6 +63,24 @@ When the gateway connects to MCP servers, it discovers their capabilities:
 - **`mcp.resources.discovered`** - Number of resources available per server
 - **`mcp.resource_templates.discovered`** - Number of resource templates available per server
 
+#### Tool Schema Dialects
+A discovered tool schema that declares JSON Schema draft-04, draft-06 or draft-07 is
+translated into 2020-12, the only dialect MCP requires clients to support:
+- **`mcp.tool.schema_dialects`** - Counter of tool schemas by what the gateway did with the
+  dialect they declared. Attributes: `mcp.server.origin`, `mcp.tool.schema_field`
+  (`inputSchema` or `outputSchema`) and `mcp.tool.schema_outcome`:
+  - `translated` - a declared draft-04/06/07 schema was converted to 2020-12
+  - `relayed` - a declared draft-04/06/07 schema held a construct with no faithful 2020-12
+    equivalent, so it was passed through as declared
+  - `unsupported_dialect` - the schema declared a dialect the gateway does not translate at
+    all (draft-03, 2019-09, anything unrecognised). Equally rejected by a 2020-12-only
+    client, and not fixable here
+
+This counter is not a census of discovered schemas. A schema that declares no dialect is
+already 2020-12 by default and is never counted, and nothing is recorded at all when the
+gateway runs with `--preserve-tool-schema-dialect`. A flat zero across all three outcomes
+therefore means no server declares any dialect.
+
 ### Client Operations
 
 #### List Operations
@@ -76,7 +94,7 @@ When clients query available capabilities:
 
 #### Tool Calls
 - **`mcp.tool.calls`** - Counter of tool invocations
-- **`mcp.tool.duration`** - Histogram of tool execution time (milliseconds)
+- **`mcp.tool.duration`** - Histogram of end-to-end tool call handling time, including validation and policy checks (milliseconds)
 - **`mcp.tool.errors`** - Counter of tool execution failures
 
 #### Prompt Operations
@@ -104,9 +122,15 @@ When using the Docker CLI directly (not through the gateway):
 ### Catalog Management
 
 Operations for managing MCP server configurations:
-- **`mcp.catalog.operations`** - Catalog management operations (ls, add, rm, create)
+- **`mcp.catalog.operations`** - Catalog management operations (ls, add, rm, create, push, pull, remove)
 - **`mcp.catalog.operation.duration`** - Duration of catalog operations
 - **`mcp.catalog.servers`** - Gauge showing number of servers in catalogs
+
+### Profile Operations
+
+Operations for managing working sets (profiles) of servers:
+- **`mcp.profile.operations`** - Profile operations (create, push, pull, remove)
+- **`mcp.profile.operation.duration`** - Duration of profile operations
 
 ## Metric Attributes
 
@@ -114,6 +138,9 @@ All metrics include contextual attributes for filtering and aggregation:
 
 ### Common Attributes
 - **`mcp.server.name`** - Name of the MCP server handling the operation
+- **`mcp.server.origin`** - Name of the MCP server a capability was discovered on. This is
+  what discovery and listing metrics carry; `mcp.server.name` is used on the tool-error
+  path, paired with `mcp.server.type`
 - **`mcp.server.type`** - Type of server (docker, stdio, sse, unknown)
 
 ### Initialize Attributes
@@ -126,6 +153,21 @@ All metrics include contextual attributes for filtering and aggregation:
 - **`mcp.resource.uri`** - URI of the resource being read
 - **`mcp.operation.error`** - Error message if operation failed
 - **`mcp.transport.mode`** - Gateway transport mode (stdio, sse, streaming)
+
+### Catalog Attributes
+- **`mcp.catalog.operation`** - Type of catalog operation (ls, add, rm, create, push, pull, remove)
+- **`mcp.catalog.name`** - Name or reference of the catalog
+- **`mcp.catalog.success`** - Boolean indicating operation success
+
+### Profile Attributes
+- **`mcp.profile.operation`** - Type of profile operation (create, push, pull, remove)
+- **`mcp.profile.id`** - Profile identifier
+- **`mcp.profile.success`** - Boolean indicating operation success
+
+### Tool Schema Dialect Attributes
+- **`mcp.tool.schema_field`** - Which schema of the tool (`inputSchema`, `outputSchema`)
+- **`mcp.tool.schema_outcome`** - What the gateway did with the declared dialect
+  (`translated`, `relayed`, `unsupported_dialect`)
 
 ## Distributed Tracing
 
@@ -409,7 +451,7 @@ When adding telemetry to new operations:
    ```go
    attrs := []attribute.KeyValue{
        attribute.String("mcp.server.name", serverConfig.Name),
-       attribute.String("mcp.server.type", inferServerType(serverConfig)),
+       attribute.String("mcp.server.type", inferServerTransportType(serverConfig)),
        attribute.String("mcp.tool.name", toolName),
    }
    ```

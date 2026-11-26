@@ -3,11 +3,109 @@ package oauth
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
 
+	"golang.org/x/oauth2"
+
+	"github.com/docker/mcp-gateway/pkg/db"
 	"github.com/docker/mcp-gateway/pkg/desktop"
+	pkgoauth "github.com/docker/mcp-gateway/pkg/oauth"
+	"github.com/docker/mcp-gateway/pkg/oauth/dcr"
+	"github.com/docker/mcp-gateway/pkg/remoteurl"
 )
 
-func Authorize(ctx context.Context, app string, scopes string) error {
+// Function pointers for testability (same pattern as pkg/workingset/oauth.go).
+var (
+	lookupIsCommunityFunc      = lookupIsCommunity
+	isCEModeFunc               = pkgoauth.IsCEMode
+	determineModeFunc          = pkgoauth.DetermineMode
+	authorizeCEModeFunc        = authorizeCEMode
+	authorizeDesktopModeFunc   = authorizeDesktopMode
+	authorizeCommunityModeFunc = authorizeCommunityMode
+
+	// Internal deps used by authorizeCommunityMode — overridden in tests to
+	// avoid requiring docker pass or binding a localhost port.
+	checkHasDockerPassFunc = desktop.CheckHasDockerPass
+	newCallbackServerFunc  = pkgoauth.NewCallbackServer
+)
+
+// Authorize performs OAuth authorization for a server, routing to the
+// appropriate flow based on the per-server mode (Desktop, CE, or Community).
+func Authorize(ctx context.Context, app string, scopes string, openBrowser bool) error {
+	isCommunity, err := lookupIsCommunityFunc(ctx, app)
+	if err != nil {
+		// Server not in catalog -- fall back to legacy global routing
+		// so existing servers without catalog entries still work.
+		if isCEModeFunc() {
+			return authorizeCEModeFunc(ctx, app, scopes, openBrowser)
+		}
+		return authorizeDesktopModeFunc(ctx, app, scopes)
+	}
+
+	switch determineModeFunc(ctx, isCommunity) {
+	case pkgoauth.ModeCE:
+		return authorizeCEModeFunc(ctx, app, scopes, openBrowser)
+	case pkgoauth.ModeCommunity:
+		return authorizeCommunityModeFunc(ctx, app, scopes, openBrowser)
+	default: // ModeDesktop
+		return authorizeDesktopModeFunc(ctx, app, scopes)
+	}
+}
+
+// openBrowserURL opens a validated authorization URL in the system's default
+// browser. Starting the platform handler remains best-effort, but an unsafe URL
+// is rejected before any process is launched.
+func openBrowserURL(rawURL string) error {
+	cmd, err := authorizationBrowserCommand(context.Background(), rawURL)
+	if err != nil {
+		return err
+	}
+	_ = cmd.Start()
+	return nil
+}
+
+func authorizationBrowserCommand(ctx context.Context, rawURL string) (*exec.Cmd, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid OAuth authorization URL: %w", err)
+	}
+	if err := remoteurl.DefaultValidator().ValidateURLWithoutResolution(parsedURL); err != nil {
+		return nil, fmt.Errorf("invalid OAuth authorization URL: %w", err)
+	}
+
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.CommandContext(ctx, "open", rawURL), nil
+	case "windows":
+		return windowsAuthorizationBrowserCommand(ctx, rawURL), nil
+	default: // linux and others
+		return exec.CommandContext(ctx, "xdg-open", rawURL), nil
+	}
+}
+
+func windowsAuthorizationBrowserCommand(ctx context.Context, rawURL string) *exec.Cmd {
+	return exec.CommandContext(ctx, "rundll32.exe", "url.dll,FileProtocolHandler", rawURL)
+}
+
+// lookupIsCommunity checks the OCI catalog database to determine if a server is a community server.
+func lookupIsCommunity(ctx context.Context, serverName string) (bool, error) {
+	dao, err := db.New()
+	if err != nil {
+		return false, fmt.Errorf("opening database: %w", err)
+	}
+	server, err := db.FindServerInCatalogs(ctx, dao, serverName)
+	if err != nil {
+		return false, err
+	}
+	return server.IsCommunity(), nil
+}
+
+// authorizeDesktopMode handles OAuth via Docker Desktop (existing behavior)
+func authorizeDesktopMode(ctx context.Context, app string, scopes string) error {
 	client := desktop.NewAuthClient()
 
 	// Start OAuth flow - Docker Desktop handles DCR automatically if needed
@@ -23,4 +121,256 @@ func Authorize(ctx context.Context, app string, scopes string) error {
 
 	fmt.Printf("Opening your browser for authentication. If it doesn't open automatically, please visit: %s\n", authResponse.BrowserURL)
 	return nil
+}
+
+// authorizeCEMode handles OAuth in standalone CE mode
+func authorizeCEMode(ctx context.Context, serverName string, scopes string, openBrowser bool) error {
+	fmt.Printf("Starting OAuth authorization for %s...\n", serverName)
+
+	// Create OAuth manager with read-write credential helper
+	credHelper := pkgoauth.NewReadWriteCredentialHelper()
+	manager := pkgoauth.NewManager(credHelper)
+
+	// Step 1: Ensure DCR client is registered
+	fmt.Printf("Checking DCR registration...\n")
+	if err := manager.EnsureDCRClient(ctx, serverName, scopes); err != nil {
+		return fmt.Errorf("DCR registration failed: %w", err)
+	}
+
+	// Step 2: Create callback server
+	callbackServer, err := pkgoauth.NewCallbackServer()
+	if err != nil {
+		return fmt.Errorf("failed to create callback server: %w", err)
+	}
+
+	// Start callback server in background
+	go func() {
+		if err := callbackServer.Start(); err != nil {
+			fmt.Printf("Callback server error: %v\n", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := callbackServer.Shutdown(shutdownCtx); err != nil {
+			fmt.Printf("Warning: failed to shutdown callback server: %v\n", err)
+		}
+	}()
+
+	// Step 3: Build authorization URL with callback URL in state
+	fmt.Printf("Generating authorization URL...\n")
+
+	scopesList := []string{}
+	if scopes != "" {
+		scopesList = []string{scopes}
+	}
+
+	// Pass callback URL - will be embedded in state for mcp-oauth proxy routing
+	callbackURL := callbackServer.URL()
+	authURL, baseState, _, err := manager.BuildAuthorizationURL(ctx, serverName, scopesList, callbackURL)
+	if err != nil {
+		return fmt.Errorf("failed to generate authorization URL: %w", err)
+	}
+
+	// Store base state for later validation
+	_ = baseState // We'll validate using the state from callback
+
+	// Step 4: Display authorization URL
+	if openBrowser {
+		fmt.Printf("Opening your browser for authentication. If it doesn't open automatically, please visit: %s\n", authURL)
+		if err := openBrowserURL(authURL); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("Please visit this URL to authorize:\n\n  %s\n\n", authURL)
+	}
+
+	// Step 5: Wait for callback
+	fmt.Printf("Waiting for authorization callback on http://127.0.0.1:%d/callback...\n", callbackServer.Port())
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	code, callbackState, err := callbackServer.Wait(timeoutCtx)
+	if err != nil {
+		return fmt.Errorf("failed to receive callback: %w", err)
+	}
+
+	// Step 6: Exchange code for token
+	fmt.Printf("Exchanging authorization code for access token...\n")
+	if err := manager.ExchangeCode(ctx, code, callbackState); err != nil {
+		return fmt.Errorf("token exchange failed: %w", err)
+	}
+
+	fmt.Printf("Authorization successful! Token stored securely.\n")
+	fmt.Printf("You can now use: docker mcp server start %s\n", serverName)
+
+	return nil
+}
+
+// authorizeCommunityMode handles OAuth for community servers in Desktop mode.
+// Uses the Gateway OAuth flow (localhost callback, PKCE) with docker pass storage.
+func authorizeCommunityMode(ctx context.Context, serverName string, scopes string, openBrowser bool) error {
+	fmt.Printf("Starting OAuth authorization for %s (community)...\n", serverName)
+
+	// Validate docker pass is available (required for community mode)
+	if err := checkHasDockerPassFunc(ctx); err != nil {
+		return fmt.Errorf("docker pass required for community server OAuth: %w", err)
+	}
+
+	// Step 1: Create callback server first — we need its localhost URL for DCR
+	// registration. Community servers reject mcp.docker.com/oauth/callback and
+	// only accept localhost redirect URIs.
+	callbackServer, err := newCallbackServerFunc()
+	if err != nil {
+		return fmt.Errorf("failed to create callback server: %w", err)
+	}
+
+	// Start callback server in background
+	go func() {
+		if err := callbackServer.Start(); err != nil {
+			fmt.Printf("Callback server error: %v\n", err)
+		}
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := callbackServer.Shutdown(shutdownCtx); err != nil {
+			fmt.Printf("Warning: failed to shutdown callback server: %v\n", err)
+		}
+	}()
+
+	callbackURL := callbackServer.URL() // http://127.0.0.1:{port}/callback
+
+	// Step 2: Ensure DCR client is registered in docker pass
+	fmt.Printf("Checking DCR registration...\n")
+	dcrClient, err := pkgoauth.GetDCRClientFromDockerPass(ctx, serverName)
+	if err != nil || dcrClient.ClientID == "" || dcrClient.RedirectURI != callbackURL {
+		// No DCR client, or the cached client was registered with a different
+		// redirect URI (e.g. after a port change). Re register so the
+		// authorization URL and token exchange use a consistent redirect URI.
+		if err == nil && dcrClient.ClientID != "" {
+			fmt.Printf("Re-registering DCR client (redirect URI changed from %q to %q)...\n", dcrClient.RedirectURI, callbackURL)
+		}
+		dcrClient, err = dcr.DiscoverAndRegister(ctx, serverName, scopes, callbackURL)
+		if err != nil {
+			return fmt.Errorf("DCR registration failed: %w", err)
+		}
+		if err := pkgoauth.SaveDCRClientToDockerPass(ctx, serverName, dcrClient); err != nil {
+			return fmt.Errorf("failed to save DCR client: %w", err)
+		}
+	}
+
+	// Step 3: Build authorization URL with PKCE
+	fmt.Printf("Generating authorization URL...\n")
+
+	provider := pkgoauth.NewDCRProvider(dcrClient, callbackURL)
+	verifier := provider.GeneratePKCE()
+
+	stateManager := pkgoauth.NewStateManager()
+	baseState := stateManager.Generate(serverName, verifier)
+
+	// Encode callback port in state for mcp-oauth proxy routing
+	parsedCallback, err := url.Parse(callbackURL)
+	if err != nil {
+		return fmt.Errorf("invalid callback URL: %w", err)
+	}
+	port := parsedCallback.Port()
+	if port == "" {
+		return fmt.Errorf("callback URL missing port")
+	}
+	state := fmt.Sprintf("mcp-gateway:%s:%s", port, baseState)
+
+	config := provider.Config()
+
+	scopesList := []string{}
+	if scopes != "" {
+		scopesList = []string{scopes}
+	}
+	if len(scopesList) > 0 {
+		config.Scopes = scopesList
+	}
+
+	opts := []oauth2.AuthCodeOption{
+		oauth2.AccessTypeOffline,
+		oauth2.S256ChallengeOption(verifier),
+	}
+	if provider.ResourceURL() != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("resource", provider.ResourceURL()))
+	}
+
+	authURL := config.AuthCodeURL(state, opts...)
+
+	// Step 4: Display authorization URL (and open browser if requested)
+	if openBrowser {
+		fmt.Printf("Opening your browser for authentication. If it doesn't open automatically, please visit: %s\n", authURL)
+		if err := openBrowserURL(authURL); err != nil {
+			return err
+		}
+	} else {
+		fmt.Printf("Please visit this URL to authorize:\n\n  %s\n\n", authURL)
+	}
+
+	// Step 5: Wait for callback
+	fmt.Printf("Waiting for authorization callback on http://127.0.0.1:%d/callback...\n", callbackServer.Port())
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	code, callbackState, err := callbackServer.Wait(timeoutCtx)
+	if err != nil {
+		return fmt.Errorf("failed to receive callback: %w", err)
+	}
+
+	// Validate the returned state to prevent CSRF attacks.
+	// When using the mcp.docker.com proxy (CE mode), the proxy strips the
+	// "mcp-gateway:PORT:" prefix. When redirecting directly to localhost
+	// (community mode), the full state comes through — strip the prefix here.
+	bareState := callbackState
+	if parts := strings.SplitN(callbackState, ":", 3); len(parts) == 3 && parts[0] == "mcp-gateway" {
+		bareState = parts[2]
+	}
+	validatedServer, validatedVerifier, err := stateManager.Validate(bareState)
+	if err != nil {
+		return fmt.Errorf("OAuth state validation failed: %w", err)
+	}
+	if validatedServer != serverName {
+		return fmt.Errorf("OAuth state mismatch: expected server %q, got %q", serverName, validatedServer)
+	}
+
+	// Step 6: Exchange code for token
+	fmt.Printf("Exchanging authorization code for access token...\n")
+
+	exchangeOpts := []oauth2.AuthCodeOption{
+		oauth2.VerifierOption(validatedVerifier),
+	}
+	if provider.ResourceURL() != "" {
+		exchangeOpts = append(exchangeOpts, oauth2.SetAuthURLParam("resource", provider.ResourceURL()))
+	}
+
+	token, err := exchangeCommunityAuthorizationCode(ctx, config, code, exchangeOpts...)
+	if err != nil {
+		return fmt.Errorf("token exchange failed: %w", err)
+	}
+
+	// Step 7: Store token in docker pass
+	if err := pkgoauth.SaveTokenToDockerPass(ctx, serverName, token); err != nil {
+		return fmt.Errorf("failed to store token: %w", err)
+	}
+
+	// Step 8: Clean stale Desktop Secrets Engine entries now that the fresh
+	// token is safely stored in docker pass. We defer this until after storage
+	// succeeds so that if the authorize flow fails at any earlier step, the
+	// user retains their existing Desktop authorization as a fallback.
+	cleanStaleDesktopEntriesFunc(ctx, serverName)
+
+	fmt.Printf("Authorization successful! Token stored securely.\n")
+	fmt.Printf("You can now use: docker mcp server start %s\n", serverName)
+
+	return nil
+}
+
+func exchangeCommunityAuthorizationCode(ctx context.Context, config *oauth2.Config, code string, opts ...oauth2.AuthCodeOption) (*oauth2.Token, error) {
+	exchangeCtx := context.WithValue(ctx, oauth2.HTTPClient, pkgoauth.NewCredentialHTTPClient(ctx, 0))
+	return config.Exchange(exchangeCtx, code, opts...)
 }

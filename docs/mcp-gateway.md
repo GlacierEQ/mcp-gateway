@@ -29,7 +29,12 @@ docker mcp gateway run --watch
 
 # Run a standalone dockerized MCP server (no catalog required)
 docker mcp gateway run --server docker.io/namespace/repository:latest
+
+# Run with a profile (requires profiles feature to be enabled)
+docker mcp gateway run --profile my-working-set
 ```
+
+See [Profiles](profiles.md) for more information about organizing servers into reusable collections.
 
 ## How to connect to an MCP Client?
 
@@ -64,8 +69,8 @@ services:
 
 + Starts an MCP Gateway for other services to use. Think AI Agents.
 + Work independently from Docker Desktop's MCP Toolkit. It can run anywhere there's a Docker engine.
-+ Defines the list of enabled servers from the gateway's command line, with `--server`
-+ Uses the online Docker MCP Catalog (v2: http://desktop.docker.com/mcp/catalog/v2/catalog.yaml by default, v3: http://desktop.docker.com/mcp/catalog/v3/catalog.yaml when `mcp-oauth-dcr` feature is enabled).
++ Defines the list of enabled servers from the gateway's command line, with `--servers`
++ Uses the online Docker MCP Catalog (v2: https://desktop.docker.com/mcp/catalog/v2/catalog.yaml by default, v3: https://desktop.docker.com/mcp/catalog/v3/catalog.yaml when `mcp-oauth-dcr` feature is enabled).
 
 ### How to run
 
@@ -79,32 +84,10 @@ See [Examples](examples/README.md)
 
 ## Complete set of command line flags
 
-```
-Docker MCP Toolkit's CLI - Manage your MCP servers and clients.
+See the generated reference: [`docker mcp gateway run`](generator/reference/mcp_gateway_run.md).
 
-Usage: docker mcp gateway run
-
-Flags:
-      --block-network             Block tools from accessing forbidden network resources
-      --block-secrets             Block secrets from being/received sent to/from tools (default true)
-      --catalog string            path to the docker-mcp.yaml catalog (absolute or relative to ~/.docker/mcp/catalogs/) (default "docker-mcp.yaml")
-      --config string             path to the config.yaml (absolute or relative to ~/.docker/mcp/) (default "config.yaml")
-      --cpus int                  CPUs allocated to each MCP Server (default is 1) (default 1)
-      --dry-run                   Start the gateway but do not listen for connections (useful for testing the configuration)
-      --interceptor stringArray   List of interceptors to use (format: when:type:path, e.g. 'before:exec:/bin/path')
-      --keep                      Keep stopped containers
-      --log-calls                 Log calls to the tools (default true)
-      --memory string             Memory allocated to each MCP Server (default is 2Gb) (default "2Gb")
-      --port int                  TCP port to listen on (default is to listen on stdio)
-      --registry string           path to the registry.yaml (absolute or relative to ~/.docker/mcp/) (default "registry.yaml")
-      --secrets docker-desktop    colon separated paths to search for secrets. Can be docker-desktop or a path to a .env file (default to using Docker Deskop's secrets API) (default "docker-desktop")
-      --servers strings           names of the servers to enable (if non empty, ignore --registry flag)
-      --tools strings             List of tools to enable
-      --transport string          stdio, sse or streaming (default is stdio) (default "stdio")
-      --verbose                   Verbose output
-      --verify-signatures         Verify signatures of the server images
-      --watch                     Watch for changes and reconfigure the gateway (default true)
-```
+It is regenerated from the command definitions by `make docs` and checked in CI, so unlike
+a pasted `--help` dump it cannot drift.
 
 ## Troubleshooting
 

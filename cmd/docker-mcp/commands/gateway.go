@@ -12,10 +12,11 @@ import (
 	"github.com/docker/mcp-gateway/cmd/docker-mcp/catalog"
 	catalogTypes "github.com/docker/mcp-gateway/pkg/catalog"
 	"github.com/docker/mcp-gateway/pkg/docker"
+	"github.com/docker/mcp-gateway/pkg/features"
 	"github.com/docker/mcp-gateway/pkg/gateway"
 )
 
-func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command {
+func gatewayCommand(docker docker.Client, dockerCli command.Cli, features features.Features) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "gateway",
 		Short: "Manage the MCP Server gateway",
@@ -33,34 +34,35 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 		// In-container.
 		// Note: The catalog URL will be updated after checking the feature flag in RunE
 		options = gateway.Config{
-			CatalogPath: []string{catalog.DockerCatalogURLV2}, // Default to v2, will be updated based on flag
 			SecretsPath: "docker-desktop:/run/secrets/mcp_secret:/.env",
 			Options: gateway.Options{
-				Cpus:         1,
-				Memory:       "2Gb",
-				Transport:    "stdio",
-				LogCalls:     true,
-				BlockSecrets: true,
-				Verbose:      true,
+				Cpus:             1,
+				Memory:           "2Gb",
+				Transport:        "stdio",
+				LogCalls:         true,
+				BlockSecrets:     true,
+				Verbose:          true,
+				VerifySignatures: true,
 			},
 		}
 	} else {
 		// On-host.
 		options = gateway.Config{
-			CatalogPath:  []string{catalog.DockerCatalogFilename},
-			RegistryPath: []string{"registry.yaml"},
-			ConfigPath:   []string{"config.yaml"},
-			ToolsPath:    []string{"tools.yaml"},
-			SecretsPath:  "docker-desktop",
+			SecretsPath: "docker-desktop",
 			Options: gateway.Options{
-				Cpus:         1,
-				Memory:       "2Gb",
-				Transport:    "stdio",
-				LogCalls:     true,
-				BlockSecrets: true,
-				Watch:        true,
+				Cpus:             1,
+				Memory:           "2Gb",
+				Transport:        "stdio",
+				LogCalls:         true,
+				BlockSecrets:     true,
+				Watch:            true,
+				VerifySignatures: true,
 			},
 		}
+	}
+	if !features.IsProfilesFeatureEnabled() {
+		// Default these only if we aren't defaulting to profiles
+		setLegacyDefaults(&options)
 	}
 
 	runCmd := &cobra.Command{
@@ -68,6 +70,25 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 		Short: "Run the gateway",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if features.IsProfilesFeatureEnabled() {
+				if len(options.ServerNames) > 0 || enableAllServers ||
+					len(options.CatalogPath) > 0 || len(options.RegistryPath) > 0 || len(options.ConfigPath) > 0 || len(options.ToolsPath) > 0 ||
+					len(additionalCatalogs) > 0 || len(additionalRegistries) > 0 || len(additionalConfigs) > 0 || len(additionalToolsConfig) > 0 ||
+					len(mcpRegistryUrls) > 0 || len(options.OciRef) > 0 ||
+					(options.SecretsPath != "docker-desktop" && !strings.HasPrefix(options.SecretsPath, "docker-desktop:")) {
+					// We're in legacy mode, so we can't use the working set feature
+					if options.WorkingSet != "" {
+						return fmt.Errorf("cannot use --profile with --servers, --enable-all-servers, --catalog, --additional-catalog, --registry, --additional-registry, --config, --additional-config, --tools-config, --additional-tools-config, --secrets, --oci-ref, --mcp-registry flags")
+					}
+					// Make sure to default the options in legacy mode
+					setLegacyDefaults(&options)
+				} else if options.WorkingSet == "" {
+					// ELSE we're in working set mode,
+					// so IF no profile specified, use the default profile
+					options.WorkingSet = "default"
+				}
+			}
+
 			// Check if OAuth interceptor feature is enabled
 			options.OAuthInterceptorEnabled = isOAuthInterceptorFeatureEnabled(dockerCli)
 
@@ -77,6 +98,15 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 			// Check if dynamic tools feature is enabled
 			options.DynamicTools = isDynamicToolsFeatureEnabled(dockerCli)
 
+			// Check if tool name prefix feature is enabled
+			options.ToolNamePrefix = isToolNamePrefixFeatureEnabled(dockerCli)
+
+			// Check if use-embeddings feature is enabled
+			options.UseEmbeddings = isUseEmbeddingsFeatureEnabled(dockerCli)
+
+			// Check if profiles feature is enabled
+			options.UseProfiles = features.IsProfilesFeatureEnabled()
+
 			// Update catalog URL based on mcp-oauth-dcr flag if using default Docker catalog URL
 			if len(options.CatalogPath) == 1 && (options.CatalogPath[0] == catalog.DockerCatalogURLV2 || options.CatalogPath[0] == catalog.DockerCatalogURLV3) {
 				options.CatalogPath[0] = catalog.GetDockerCatalogURL(options.McpOAuthDcrEnabled)
@@ -84,11 +114,6 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 
 			if options.Static {
 				options.Watch = false
-			}
-
-			if options.Central {
-				options.Watch = false
-				options.Transport = "streaming"
 			}
 
 			if options.Transport == "stdio" {
@@ -145,14 +170,29 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 				options.ServerNames = allServerNames
 			}
 
+			// Disable dynamic-tools if the user explicitly configured a set of servers via the --servers flag.
+			// When users specify servers explicitly, they're operating in a more manual mode
+			// and may not want the automatic server management tools (mcp-find, mcp-add, mcp-remove).
+			if len(options.ServerNames) > 0 && !enableAllServers {
+				if options.DynamicTools {
+					options.DynamicTools = false
+					if options.Verbose {
+						fmt.Fprintln(dockerCli.Err(), "Note: dynamic-tools disabled when using --servers flag")
+					}
+				}
+			}
+
 			return gateway.NewGateway(options, docker).Run(cmd.Context())
 		},
 	}
 
 	runCmd.Flags().StringSliceVar(&options.ServerNames, "servers", nil, "Names of the servers to enable (if non empty, ignore --registry flag)")
+	if features.IsProfilesFeatureEnabled() {
+		runCmd.Flags().StringVar(&options.WorkingSet, "profile", "", "Profile ID to use (mutually exclusive with --servers and --enable-all-servers)")
+	}
 	runCmd.Flags().BoolVar(&enableAllServers, "enable-all-servers", false, "Enable all servers in the catalog (instead of using individual --servers options)")
-	runCmd.Flags().StringSliceVar(&options.CatalogPath, "catalog", options.CatalogPath, "Paths to docker catalogs (absolute or relative to ~/.docker/mcp/catalogs/)")
-	runCmd.Flags().StringSliceVar(&additionalCatalogs, "additional-catalog", nil, "Additional catalog paths to append to the default catalogs")
+	runCmd.Flags().StringSliceVar(&options.CatalogPath, "catalog", options.CatalogPath, "Catalog paths must resolve under ~/.docker/mcp/catalogs/")
+	runCmd.Flags().StringSliceVar(&additionalCatalogs, "additional-catalog", nil, "Additional catalog paths must resolve under ~/.docker/mcp/catalogs/")
 	runCmd.Flags().StringSliceVar(&options.RegistryPath, "registry", options.RegistryPath, "Paths to the registry files (absolute or relative to ~/.docker/mcp/)")
 	runCmd.Flags().StringSliceVar(&additionalRegistries, "additional-registry", nil, "Additional registry paths to merge with the default registry.yaml")
 	runCmd.Flags().StringSliceVar(&options.ConfigPath, "config", options.ConfigPath, "Paths to the config files (absolute or relative to ~/.docker/mcp/)")
@@ -165,11 +205,14 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 	runCmd.Flags().StringArrayVar(&options.OciRef, "oci-ref", options.OciRef, "OCI image references to use")
 	runCmd.Flags().StringSliceVar(&mcpRegistryUrls, "mcp-registry", nil, "MCP registry URLs to fetch servers from (can be repeated)")
 	runCmd.Flags().IntVar(&options.Port, "port", options.Port, "TCP port to listen on (default is to listen on stdio)")
-	runCmd.Flags().StringVar(&options.Transport, "transport", options.Transport, "stdio, sse or streaming (default is stdio)")
+	runCmd.Flags().StringVar(&options.Host, "host", options.Host, "Host or IP address to bind TCP transports to")
+	runCmd.Flags().StringVar(&options.Transport, "transport", options.Transport, "stdio, sse or streaming. Uses MCP_GATEWAY_AUTH_TOKEN environment variable for localhost authentication to prevent dns rebinding attacks.")
+	runCmd.Flags().BoolVar(&options.AllowUnauthenticated, "allow-unauthenticated", options.AllowUnauthenticated, "Allow unauthenticated HTTP/SSE gateway requests")
+	runCmd.Flags().BoolVar(&options.PreserveToolSchemaDialect, "preserve-tool-schema-dialect", options.PreserveToolSchemaDialect, "Relay tool schemas with the JSON Schema dialect the server declared, instead of translating pre-2020-12 dialects")
 	runCmd.Flags().BoolVar(&options.LogCalls, "log-calls", options.LogCalls, "Log calls to the tools")
 	runCmd.Flags().BoolVar(&options.BlockSecrets, "block-secrets", options.BlockSecrets, "Block secrets from being/received sent to/from tools")
 	runCmd.Flags().BoolVar(&options.BlockNetwork, "block-network", options.BlockNetwork, "Block tools from accessing forbidden network resources")
-	runCmd.Flags().BoolVar(&options.VerifySignatures, "verify-signatures", options.VerifySignatures, "Verify signatures of the server images")
+	runCmd.Flags().BoolVar(&options.VerifySignatures, "verify-signatures", options.VerifySignatures, "Verify signatures of Docker MCP server images")
 	runCmd.Flags().BoolVar(&options.DryRun, "dry-run", options.DryRun, "Start the gateway but do not listen for connections (useful for testing the configuration)")
 	runCmd.Flags().BoolVar(&options.Verbose, "verbose", options.Verbose, "Verbose output")
 	runCmd.Flags().BoolVar(&options.LongLived, "long-lived", options.LongLived, "Containers are long-lived and will not be removed until the gateway is stopped, useful for stateful servers")
@@ -178,10 +221,10 @@ func gatewayCommand(docker docker.Client, dockerCli command.Cli) *cobra.Command 
 	runCmd.Flags().IntVar(&options.Cpus, "cpus", options.Cpus, "CPUs allocated to each MCP Server (default is 1)")
 	runCmd.Flags().StringVar(&options.Memory, "memory", options.Memory, "Memory allocated to each MCP Server (default is 2Gb)")
 	runCmd.Flags().BoolVar(&options.Static, "static", options.Static, "Enable static mode (aka pre-started servers)")
+	runCmd.Flags().StringVar(&options.LogFilePath, "log", options.LogFilePath, "Path to log file for stderr output (relative or absolute)")
 
 	// Very experimental features
-	runCmd.Flags().BoolVar(&options.Central, "central", options.Central, "In central mode, clients tell us which servers to enable")
-	_ = runCmd.Flags().MarkHidden("central")
+	_ = runCmd.Flags().MarkHidden("log")
 
 	cmd.AddCommand(runCmd)
 
@@ -282,12 +325,12 @@ func isOAuthInterceptorFeatureEnabled(dockerCli command.Cli) bool {
 func isMcpOAuthDcrFeatureEnabled(dockerCli command.Cli) bool {
 	configFile := dockerCli.ConfigFile()
 	if configFile == nil || configFile.Features == nil {
-		return false
+		return true // Default enabled when no config exists
 	}
 
 	value, exists := configFile.Features["mcp-oauth-dcr"]
 	if !exists {
-		return false
+		return true // Default enabled when not in config
 	}
 
 	return value == "enabled"
@@ -297,13 +340,63 @@ func isMcpOAuthDcrFeatureEnabled(dockerCli command.Cli) bool {
 func isDynamicToolsFeatureEnabled(dockerCli command.Cli) bool {
 	configFile := dockerCli.ConfigFile()
 	if configFile == nil || configFile.Features == nil {
-		return false
+		return true // Default enabled when no config exists
 	}
 
 	value, exists := configFile.Features["dynamic-tools"]
 	if !exists {
+		return true // Default enabled when not in config
+	}
+
+	return value == "enabled"
+}
+
+// isToolNamePrefixFeatureEnabled checks if the tool-name-prefix feature is enabled
+func isToolNamePrefixFeatureEnabled(dockerCli command.Cli) bool {
+	configFile := dockerCli.ConfigFile()
+	if configFile == nil || configFile.Features == nil {
 		return false
 	}
 
+	value, exists := configFile.Features["tool-name-prefix"]
+	if !exists {
+		return false
+	}
+
+	return value == "enabled"
+}
+
+func setLegacyDefaults(options *gateway.Config) {
+	if os.Getenv("DOCKER_MCP_IN_CONTAINER") == "1" {
+		if len(options.CatalogPath) == 0 {
+			options.CatalogPath = []string{catalog.DockerCatalogURLV2} // Default to v2, will be updated based on flag
+		}
+	} else {
+		if len(options.CatalogPath) == 0 {
+			options.CatalogPath = []string{catalog.DockerCatalogFilename}
+		}
+		if len(options.RegistryPath) == 0 {
+			options.RegistryPath = []string{"registry.yaml"}
+		}
+		if len(options.ConfigPath) == 0 {
+			options.ConfigPath = []string{"config.yaml"}
+		}
+		if len(options.ToolsPath) == 0 {
+			options.ToolsPath = []string{"tools.yaml"}
+		}
+	}
+}
+
+// isUseEmbeddingsFeatureEnabled checks if the use-embeddings feature is enabled
+func isUseEmbeddingsFeatureEnabled(dockerCli command.Cli) bool {
+	configFile := dockerCli.ConfigFile()
+	if configFile == nil || configFile.Features == nil {
+		return false
+	}
+
+	value, exists := configFile.Features["use-embeddings"]
+	if !exists {
+		return false
+	}
 	return value == "enabled"
 }

@@ -3,25 +3,28 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
+	"github.com/docker/cli/cli/command"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/spf13/cobra"
-
-	"github.com/docker/mcp-gateway/cmd/docker-mcp/client"
+	clientcli "github.com/docker/mcp-gateway/cmd/docker-mcp/client"
+	"github.com/docker/mcp-gateway/pkg/client"
+	"github.com/docker/mcp-gateway/pkg/features"
 )
 
-func clientCommand(cwd string) *cobra.Command {
+func clientCommand(dockerCli command.Cli, cwd string, features features.Features) *cobra.Command {
 	cfg := client.ReadConfig()
 	cmd := &cobra.Command{
 		Use:   fmt.Sprintf("client (Supported: %s)", strings.Join(client.GetSupportedMCPClients(*cfg), ", ")),
 		Short: "Manage MCP clients",
 	}
 	cmd.AddCommand(listClientCommand(cwd, *cfg))
-	cmd.AddCommand(connectClientCommand(cwd, *cfg))
+	cmd.AddCommand(connectClientCommand(dockerCli, cwd, *cfg, features))
 	cmd.AddCommand(disconnectClientCommand(cwd, *cfg))
-	cmd.AddCommand(manualClientCommand())
+	cmd.AddCommand(manualClientCommand(features))
 	return cmd
 }
 
@@ -35,7 +38,7 @@ func listClientCommand(cwd string, cfg client.Config) *cobra.Command {
 		Short: "List client configurations",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return client.List(cmd.Context(), cwd, cfg, opts.Global, opts.JSON)
+			return clientcli.List(cmd.Context(), cwd, cfg, opts.Global, opts.JSON)
 		},
 	}
 	flags := cmd.Flags()
@@ -44,22 +47,26 @@ func listClientCommand(cwd string, cfg client.Config) *cobra.Command {
 	return cmd
 }
 
-func connectClientCommand(cwd string, cfg client.Config) *cobra.Command {
+func connectClientCommand(dockerCli command.Cli, cwd string, cfg client.Config, features features.Features) *cobra.Command {
 	var opts struct {
-		Global bool
-		Quiet  bool
+		Global     bool
+		Quiet      bool
+		WorkingSet string
 	}
 	cmd := &cobra.Command{
 		Use:   fmt.Sprintf("connect [OPTIONS] <mcp-client>\n\nSupported clients: %s", strings.Join(client.GetSupportedMCPClients(cfg), " ")),
 		Short: fmt.Sprintf("Connect the Docker MCP Toolkit to a client. Supported clients: %s", strings.Join(client.GetSupportedMCPClients(cfg), " ")),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return client.Connect(cmd.Context(), cwd, cfg, args[0], opts.Global, opts.Quiet)
+			return clientcli.Connect(cmd.Context(), dockerCli, cwd, cfg, args[0], opts.Global, opts.Quiet, opts.WorkingSet)
 		},
 	}
 	flags := cmd.Flags()
 	addGlobalFlag(flags, &opts.Global)
 	addQuietFlag(flags, &opts.Quiet)
+	if features.IsProfilesFeatureEnabled() {
+		_ = cmd.MarkFlagRequired(addWorkingSetFlag(flags, &opts.WorkingSet))
+	}
 	return cmd
 }
 
@@ -73,7 +80,7 @@ func disconnectClientCommand(cwd string, cfg client.Config) *cobra.Command {
 		Short: fmt.Sprintf("Disconnect the Docker MCP Toolkit from a client. Supported clients: %s", strings.Join(client.GetSupportedMCPClients(cfg), " ")),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return client.Disconnect(cmd.Context(), cwd, cfg, args[0], opts.Global, opts.Quiet)
+			return clientcli.Disconnect(cmd.Context(), cwd, cfg, args[0], opts.Global, opts.Quiet)
 		},
 	}
 	flags := cmd.Flags()
@@ -82,7 +89,7 @@ func disconnectClientCommand(cwd string, cfg client.Config) *cobra.Command {
 	return cmd
 }
 
-func manualClientCommand() *cobra.Command {
+func manualClientCommand(features features.Features) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "manual-instructions",
 		Short: "Display the manual instructions to connect the MCP client",
@@ -94,6 +101,16 @@ func manualClientCommand() *cobra.Command {
 			}
 
 			command := []string{"docker", "mcp", "gateway", "run"}
+			if features.IsProfilesFeatureEnabled() {
+				gordonProfile, err := client.ReadGordonProfile()
+				if err != nil {
+					return fmt.Errorf("failed to read gordon profile: %w", err)
+				}
+				if gordonProfile != "" {
+					command = append(command, "--profile", gordonProfile)
+				}
+				fmt.Fprintf(os.Stderr, "Deprecation notice: This command is deprecated and only used for Gordon in Docker Desktop. Please use `docker mcp profile manual-instructions <profile-id>` instead.\n")
+			}
 			if printAsJSON {
 				buf, err := json.Marshal(command)
 				if err != nil {
@@ -118,4 +135,9 @@ func addGlobalFlag(flags *pflag.FlagSet, p *bool) {
 
 func addQuietFlag(flags *pflag.FlagSet, p *bool) {
 	flags.BoolVarP(p, "quiet", "q", false, "Only display errors.")
+}
+
+func addWorkingSetFlag(flags *pflag.FlagSet, p *string) string {
+	flags.StringVarP(p, "profile", "p", "", "Profile to use for client connection.")
+	return "profile"
 }

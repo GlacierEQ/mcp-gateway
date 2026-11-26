@@ -8,7 +8,8 @@ options:
     - option: additional-catalog
       value_type: stringSlice
       default_value: '[]'
-      description: Additional catalog paths to append to the default catalogs
+      description: |
+        Additional catalog paths must resolve under ~/.docker/mcp/catalogs/
       deprecated: false
       hidden: false
       experimental: false
@@ -45,6 +46,16 @@ options:
       experimentalcli: false
       kubernetes: false
       swarm: false
+    - option: allow-unauthenticated
+      value_type: bool
+      default_value: "false"
+      description: Allow unauthenticated HTTP/SSE gateway requests
+      deprecated: false
+      hidden: false
+      experimental: false
+      experimentalcli: false
+      kubernetes: false
+      swarm: false
     - option: block-network
       value_type: bool
       default_value: "false"
@@ -68,20 +79,9 @@ options:
     - option: catalog
       value_type: stringSlice
       default_value: '[docker-mcp.yaml]'
-      description: |
-        Paths to docker catalogs (absolute or relative to ~/.docker/mcp/catalogs/)
+      description: Catalog paths must resolve under ~/.docker/mcp/catalogs/
       deprecated: false
       hidden: false
-      experimental: false
-      experimentalcli: false
-      kubernetes: false
-      swarm: false
-    - option: central
-      value_type: bool
-      default_value: "false"
-      description: In central mode, clients tell us which servers to enable
-      deprecated: false
-      hidden: true
       experimental: false
       experimentalcli: false
       kubernetes: false
@@ -138,6 +138,15 @@ options:
       experimentalcli: false
       kubernetes: false
       swarm: false
+    - option: host
+      value_type: string
+      description: Host or IP address to bind TCP transports to
+      deprecated: false
+      hidden: false
+      experimental: false
+      experimentalcli: false
+      kubernetes: false
+      swarm: false
     - option: interceptor
       value_type: stringArray
       default_value: '[]'
@@ -145,6 +154,15 @@ options:
         List of interceptors to use (format: when:type:path, e.g. 'before:exec:/bin/path')
       deprecated: false
       hidden: false
+      experimental: false
+      experimentalcli: false
+      kubernetes: false
+      swarm: false
+    - option: log
+      value_type: string
+      description: Path to log file for stderr output (relative or absolute)
+      deprecated: false
+      hidden: true
       experimental: false
       experimentalcli: false
       kubernetes: false
@@ -204,6 +222,17 @@ options:
       value_type: int
       default_value: "0"
       description: TCP port to listen on (default is to listen on stdio)
+      deprecated: false
+      hidden: false
+      experimental: false
+      experimentalcli: false
+      kubernetes: false
+      swarm: false
+    - option: preserve-tool-schema-dialect
+      value_type: bool
+      default_value: "false"
+      description: |
+        Relay tool schemas with the JSON Schema dialect the server declared, instead of translating pre-2020-12 dialects
       deprecated: false
       hidden: false
       experimental: false
@@ -276,7 +305,8 @@ options:
     - option: transport
       value_type: string
       default_value: stdio
-      description: stdio, sse or streaming (default is stdio)
+      description: |
+        stdio, sse or streaming. Uses MCP_GATEWAY_AUTH_TOKEN environment variable for localhost authentication to prevent dns rebinding attacks.
       deprecated: false
       hidden: false
       experimental: false
@@ -295,8 +325,8 @@ options:
       swarm: false
     - option: verify-signatures
       value_type: bool
-      default_value: "false"
-      description: Verify signatures of the server images
+      default_value: "true"
+      description: Verify signatures of Docker MCP server images
       deprecated: false
       hidden: false
       experimental: false

@@ -11,10 +11,11 @@ import (
 	"github.com/docker/docker/api/types/network"
 
 	"github.com/docker/mcp-gateway/pkg/docker"
+	"github.com/docker/mcp-gateway/pkg/log"
 	"github.com/docker/mcp-gateway/pkg/sliceutil"
 )
 
-const l4Image = "docker/mcp-l4proxy:v1@sha256:121b87decc25cda901dbd4ffbd20b116fffbd0fbeecc827c228fa45094a9934c"
+const l4Image = "docker/mcp-l4proxy:v1@sha256:83c560e8938f6218e486b732469f49bd753dc832f0488a7386be4540242fff82"
 
 // runL4Proxies takes a list of L4 proxies and starts an L4 proxy container for
 // each hostname. It updates the target config with the container links to add
@@ -33,7 +34,7 @@ func runL4Proxies(ctx context.Context, cli docker.Client, target *TargetConfig, 
 		if retErr != nil && !keepCtrs {
 			for _, name := range proxyNames {
 				if err := cli.RemoveContainer(ctx, name, true); err != nil {
-					logf("failed to remove proxy container %s: %v", name, err)
+					log.Logf("failed to remove proxy container %s: %v", name, err)
 				}
 			}
 		}
@@ -76,7 +77,7 @@ func runL4Proxy(ctx context.Context, cli docker.Client, proxyName, hostname, int
 		return strconv.Itoa(int(p))
 	}), ",")
 
-	logf("starting l4 proxy %s for %s, ports %s", proxyName, hostname, portsStr)
+	log.Logf("starting l4 proxy %s for %s, ports %s", proxyName, hostname, portsStr)
 
 	err := cli.StartContainer(ctx, proxyName,
 		container.Config{

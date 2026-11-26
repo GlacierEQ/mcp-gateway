@@ -1,12 +1,11 @@
 #syntax=docker/dockerfile:1
 
-ARG GO_VERSION=1.24.5
+ARG GO_VERSION=1.26.10
 ARG DOCS_FORMATS="md,yaml"
-
-FROM --platform=${BUILDPLATFORM} golangci/golangci-lint:v2.1.6-alpine AS lint-base
+ARG GOLANGCI_LINT_VERSION=v2.11.3
 
 FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine AS base
-RUN apk add --no-cache git rsync
+RUN apk add --no-cache git
 WORKDIR /app
 
 # Docs generation and validation targets
@@ -20,10 +19,8 @@ FROM base AS docs-build
 COPY --from=docs-gen /out/docsgen /usr/bin
 ENV DOCKER_CLI_PLUGIN_ORIGINAL_CLI_COMMAND="mcp"
 ARG DOCS_FORMATS
-RUN --mount=target=/context \
-    --mount=target=.,type=tmpfs <<EOT
+RUN --mount=type=bind,target=.,rw <<EOT
   set -e
-  rsync -a /context/. .
   docsgen --formats "$DOCS_FORMATS" --source "docs/generator/reference"
   mkdir /out
   cp -r docs/generator/reference/* /out/
@@ -33,10 +30,8 @@ FROM scratch AS docs-update
 COPY --from=docs-build /out /
 
 FROM docs-build AS docs-validate
-RUN --mount=target=/context \
-    --mount=target=.,type=tmpfs <<EOT
+RUN --mount=type=bind,target=.,rw <<EOT
   set -e
-  rsync -a /context/. .
   git add -A
   rm -rf docs/generator/reference/*
   cp -rf /out/* ./docs/generator/reference/
@@ -48,9 +43,12 @@ RUN --mount=target=/context \
 EOT
 
 FROM base AS lint
-COPY --from=lint-base /usr/bin/golangci-lint /usr/bin/golangci-lint
+ARG GOLANGCI_LINT_VERSION
 ARG TARGETOS
 ARG TARGETARCH
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
 RUN --mount=target=. \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
@@ -127,8 +125,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=source=./tools/docker-mcp-bridge,target=. \
     go build -trimpath -ldflags "-s -w" -o /docker-mcp-bridge .
 
-FROM alpine:3.22@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1 AS mcp-gateway
-RUN apk add --no-cache docker-cli socat jq
+FROM alpine:3.23@sha256:865b95f46d98cf867a156fe4a135ad3fe50d2056aa3f25ed31662dff6da4eb62 AS mcp-gateway
+RUN apk update && apk upgrade --no-cache && apk add --no-cache docker-cli socat jq 'ca-certificates>=20261020-r0'
 VOLUME /misc
 COPY --from=build-mcp-bridge /docker-mcp-bridge /misc/
 ENV DOCKER_MCP_IN_CONTAINER=1
@@ -142,8 +140,8 @@ RUN rm /usr/local/bin/docker-compose \
 
 FROM scratch AS mcp-gateway-dind
 COPY --from=dind / /
-RUN apk add --no-cache socat jq
-COPY --from=docker/mcp-gateway /docker-mcp /
+RUN apk update && apk upgrade --no-cache && apk add --no-cache socat jq 'ca-certificates>=20261020-r0'
+COPY --from=build-mcp-gateway /docker-mcp /
 RUN cat <<-'EOF' >/run.sh
 	#!/usr/bin/env sh
 	set -euxo pipefail

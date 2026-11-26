@@ -15,12 +15,16 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/docker/mcp-gateway/pkg/remoteurl"
 )
 
 // TestIntegrationRemoteWithCustomHeaders tests that custom headers (including Authorization
 // with Bearer tokens from secrets) are properly transmitted to remote MCP servers.
 func TestIntegrationRemoteWithCustomHeaders(t *testing.T) {
 	thisIsAnIntegrationTest(t)
+	t.Setenv(remoteurl.AllowInsecureRemoteURLEnv, "1")
+
 	// Start a test MCP server that can validate the Authorization header
 	server := newTestMCPServer(t)
 	defer server.close()
@@ -46,7 +50,7 @@ registry:
         env: AUTH_TOKEN
 `, server.url)
 
-	writeFile(t, tmp, "catalog.yaml", catalogContent)
+	catalogFile := writeTrustedCatalogFile(t, "catalog.yaml", catalogContent)
 
 	// Optional: uncomment for debugging
 	// fmt.Printf("DEBUG: Catalog content:\n%s\n", catalogContent)
@@ -56,7 +60,7 @@ registry:
 	gatewayArgs := []string{
 		"--servers=test-server",
 		"--secrets=" + filepath.Join(tmp, ".env"),
-		"--catalog=" + filepath.Join(tmp, "catalog.yaml"),
+		"--catalog=" + catalogFile,
 	}
 
 	out := runDockerMCP(t, "tools", "call", "--gateway-arg="+strings.Join(gatewayArgs, ","), "get_auth_header")
@@ -81,7 +85,9 @@ func newTestMCPServer(t *testing.T) *testMCPServer {
 	s := &testMCPServer{}
 
 	// Create a listener to get a random port
-	listener, err := net.Listen("tcp", ":0")
+	ctx := context.Background()
+	lc := &net.ListenConfig{}
+	listener, err := lc.Listen(ctx, "tcp", ":0")
 	require.NoError(t, err, "Failed to create listener")
 
 	s.listener = listener

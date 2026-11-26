@@ -8,10 +8,90 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"sync"
 	"time"
 )
 
 var ClientBackend = newRawClient(dialBackend)
+
+var (
+	desktopProxyTransportOnce sync.Once
+	desktopProxyTransportInst http.RoundTripper
+)
+
+// ProxyTransport returns an HTTP transport configured to proxy HTTP requests.
+// If HTTP_PROXY/HTTPS_PROXY environment variables are set, they take precedence and
+// are respected via http.ProxyFromEnvironment. Otherwise, when Docker Desktop is running,
+// traffic is routed through Docker Desktop's HTTP proxy socket. If neither applies,
+// http.DefaultTransport is returned.
+// The transport is initialized once using sync.Once and cached for subsequent calls.
+func ProxyTransport() http.RoundTripper {
+	desktopProxyTransportOnce.Do(func() {
+		// Env proxy vars take precedence over Docker Desktop's proxy socket.
+		if hasEnvProxyVars() {
+			desktopProxyTransportInst = &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+			}
+			return
+		}
+
+		transport := DockerDesktopProxySocketTransport(context.Background())
+		if transport == nil {
+			desktopProxyTransportInst = http.DefaultTransport
+			return
+		}
+		desktopProxyTransportInst = transport
+	})
+
+	return desktopProxyTransportInst
+}
+
+// DockerDesktopProxySocketTransport returns a transport that proxies through
+// Docker Desktop's local HTTP proxy socket only. It intentionally ignores
+// HTTP_PROXY/HTTPS_PROXY environment variables so callers can opt into the
+// trusted Desktop socket without permitting arbitrary forward proxies.
+func DockerDesktopProxySocketTransport(ctx context.Context) http.RoundTripper {
+	dialer := DockerDesktopProxySocketDialer(ctx)
+	if dialer == nil {
+		return nil
+	}
+
+	return &http.Transport{
+		Proxy: http.ProxyURL(&url.URL{
+			Scheme: "http",
+		}),
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer(ctx)
+		},
+	}
+}
+
+// DockerDesktopProxySocketDialer returns a dialer for Docker Desktop's local
+// HTTP proxy socket only. It intentionally ignores HTTP_PROXY/HTTPS_PROXY
+// environment variables so guarded callers can opt into the trusted Desktop
+// socket without permitting arbitrary forward proxies.
+func DockerDesktopProxySocketDialer(ctx context.Context) func(context.Context) (net.Conn, error) {
+	if !IsRunningInDockerDesktop(ctx) {
+		return nil
+	}
+	if !desktopProxySocketAvailable(ctx) {
+		return nil
+	}
+
+	return dialHTTPProxy
+}
+
+// hasEnvProxyVars returns true if any HTTP proxy environment variables are set.
+func hasEnvProxyVars() bool {
+	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		if os.Getenv(name) != "" {
+			return true
+		}
+	}
+	return false
+}
 
 func AvoidResourceSaverMode(ctx context.Context) {
 	_ = ClientBackend.Post(ctx, "/idle/make-busy", nil, nil)
@@ -103,11 +183,6 @@ func (c *RawClient) Post(ctx context.Context, endpoint string, v any, result any
 	}
 	defer response.Body.Close()
 
-	if result == nil {
-		_, err := io.Copy(io.Discard, response.Body)
-		return err
-	}
-
 	buf, err := io.ReadAll(response.Body)
 	if err != nil {
 		return err
@@ -123,6 +198,10 @@ func (c *RawClient) Post(ctx context.Context, endpoint string, v any, result any
 			return fmt.Errorf("HTTP %d: %s", response.StatusCode, errorMsg.Message)
 		}
 		return fmt.Errorf("HTTP %d: %s", response.StatusCode, string(buf))
+	}
+
+	if result == nil {
+		return nil
 	}
 
 	if err := json.Unmarshal(buf, &result); err != nil {
@@ -148,6 +227,22 @@ func (c *RawClient) Delete(ctx context.Context, endpoint string) error {
 	}
 	defer response.Body.Close()
 
-	_, err = io.Copy(io.Discard, response.Body)
-	return err
+	buf, err := io.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+
+	// Check HTTP status code - return error for non-2xx responses
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// Try to parse error message from response
+		var errorMsg struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(buf, &errorMsg) == nil && errorMsg.Message != "" {
+			return fmt.Errorf("HTTP %d: %s", response.StatusCode, errorMsg.Message)
+		}
+		return fmt.Errorf("HTTP %d: %s", response.StatusCode, string(buf))
+	}
+
+	return nil
 }

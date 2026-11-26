@@ -1,147 +1,220 @@
 package workingset
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
-	"github.com/docker/mcp-gateway/pkg/user"
 	"gopkg.in/yaml.v3"
+
+	"github.com/docker/mcp-gateway/pkg/db"
+	"github.com/docker/mcp-gateway/pkg/oci"
 )
 
-type WorkingSetIndex struct {
-	WorkingSets map[string]struct {
-		Path string `yaml:"path" json:"path"`
-	} `yaml:"workingSets" json:"workingSets"`
-}
+func UpdateConfig(ctx context.Context, dao db.DAO, ociService oci.Service, id string, setConfigArgs, getConfigArgs, delConfigArgs []string, getAll bool, outputFormat OutputFormat) error {
+	// Verify there is not conflict
+	for _, delConfigArg := range delConfigArgs {
+		for _, setConfigArg := range setConfigArgs {
+			first, _, found := strings.Cut(setConfigArg, "=")
+			if found && delConfigArg == first {
+				return fmt.Errorf("cannot both delete and set the same config value: %s", delConfigArg)
+			}
+		}
+	}
 
-func Write(workingSet WorkingSet) error {
-	index, err := readIndexOrEmpty()
+	dbWorkingSet, err := dao.GetWorkingSet(ctx, id)
 	if err != nil {
-		return err
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("profile %s not found", id)
+		}
+		return fmt.Errorf("failed to get profile: %w", err)
 	}
 
-	path, err := filePath(workingSet.ID + ".yaml")
-	if err != nil {
-		return err
+	workingSet := NewFromDb(dbWorkingSet)
+
+	if err := workingSet.EnsureSnapshotsResolved(ctx, ociService); err != nil {
+		return fmt.Errorf("failed to resolve snapshots: %w", err)
 	}
 
-	index.WorkingSets[workingSet.ID] = struct {
-		Path string `yaml:"path" json:"path"`
-	}{Path: path}
+	outputMap := make(map[string]any)
 
-	data, err := yaml.Marshal(workingSet)
-	if err != nil {
-		return err
+	if getAll {
+		for _, server := range workingSet.Servers {
+			for configName, value := range flattenConfig(server.Config) {
+				outputMap[fmt.Sprintf("%s.%s", server.Snapshot.Server.Name, configName)] = value
+			}
+		}
+	} else {
+		for _, configArg := range getConfigArgs {
+			serverName, configName, found := strings.Cut(configArg, ".")
+			if !found {
+				return fmt.Errorf("invalid config argument: %s, expected <serverName>.<configName>", configArg)
+			}
+
+			server := workingSet.FindServer(serverName)
+			if server == nil {
+				return fmt.Errorf("server %s not found in profile for argument %s", serverName, configArg)
+			}
+
+			value := getConfigValue(configName, server.Config)
+			if value != nil {
+				outputMap[configArg] = value
+			}
+		}
 	}
 
-	if err := writeWorkingSetFile(path, data); err != nil {
-		return err
+	for _, configArg := range setConfigArgs {
+		key, value, found := strings.Cut(configArg, "=")
+		if !found {
+			return fmt.Errorf("invalid config argument: %s, expected <serverName>.<configName>=<value>", configArg)
+		}
+
+		serverName, configName, found := strings.Cut(key, ".")
+		if !found {
+			return fmt.Errorf("invalid config argument: %s, expected <serverName>.<configName>=<value>", key)
+		}
+
+		server := workingSet.FindServer(serverName)
+		if server == nil {
+			return fmt.Errorf("server %s not found in profile for argument %s", serverName, configArg)
+		}
+
+		if server.Config == nil {
+			server.Config = make(map[string]any)
+		}
+		// TODO(cody): validate that schema supports the config we're adding
+		finalValue := any(value)
+		var decoded any
+		if err := json.Unmarshal([]byte(value), &decoded); err == nil {
+			finalValue = decoded
+		}
+		mergeValueIntoMap(server.Config, configName, finalValue)
+		outputMap[key] = finalValue
 	}
 
-	if err := writeIndex(index); err != nil {
-		return err
+	for _, delConfigArg := range delConfigArgs {
+		serverName, configName, found := strings.Cut(delConfigArg, ".")
+		if !found {
+			return fmt.Errorf("invalid config argument: %s, expected <serverName>.<configName>", delConfigArg)
+		}
+
+		server := workingSet.FindServer(serverName)
+		if server == nil {
+			return fmt.Errorf("server %s not found in profile for argument %s", serverName, delConfigArg)
+		}
+
+		if server.Config != nil && deleteValueFromMap(server.Config, configName) {
+			delete(outputMap, delConfigArg)
+		}
+	}
+
+	if len(setConfigArgs) > 0 || len(delConfigArgs) > 0 {
+		err := dao.UpdateWorkingSet(ctx, workingSet.ToDb())
+		if err != nil {
+			return fmt.Errorf("failed to update profile: %w", err)
+		}
+	}
+
+	switch outputFormat {
+	case OutputFormatHumanReadable:
+		for configName, value := range outputMap {
+			fmt.Printf("%s=%v\n", configName, value)
+		}
+	case OutputFormatJSON:
+		data, err := json.MarshalIndent(outputMap, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal output: %w", err)
+		}
+		fmt.Println(string(data))
+	case OutputFormatYAML:
+		data, err := yaml.Marshal(outputMap)
+		if err != nil {
+			return fmt.Errorf("failed to marshal output: %w", err)
+		}
+		fmt.Println(string(data))
+	default:
+		return fmt.Errorf("unsupported output format: %s", outputFormat)
 	}
 
 	return nil
 }
 
-func Read(id string) (*WorkingSet, error) {
-	index, err := readIndexOrEmpty()
-	if err != nil {
-		return nil, err
-	}
-
-	if _, found := index.WorkingSets[id]; !found {
-		return nil, fmt.Errorf("working set %s not found", id)
-	}
-
-	workingSetBuf, err := readWorkingSetFile(index.WorkingSets[id].Path)
-	if err != nil {
-		return nil, err
-	}
-
-	var workingSet WorkingSet
-	if err := yaml.Unmarshal(workingSetBuf, &workingSet); err != nil {
-		return nil, err
-	}
-
-	return &workingSet, nil
-}
-
-func writeIndex(index *WorkingSetIndex) error {
-	path, err := filePath("index.json")
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	data, err := json.MarshalIndent(index, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(path, data, 0o644)
-}
-
-func readIndexOrEmpty() (*WorkingSetIndex, error) {
-	buf, err := readWorkingSetFile("index.json")
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &WorkingSetIndex{
-				WorkingSets: map[string]struct {
-					Path string `yaml:"path" json:"path"`
-				}{},
-			}, nil
+func flattenConfig(config map[string]any) map[string]any {
+	output := make(map[string]any)
+	for key, value := range config {
+		if sub, ok := value.(map[string]any); ok {
+			for subKey, subValue := range flattenConfig(sub) {
+				output[fmt.Sprintf("%s.%s", key, subKey)] = subValue
+			}
+		} else {
+			if strings.Contains(key, ".") {
+				// Ignore keys that contain a dot, unsupported
+				continue
+			}
+			output[key] = value
 		}
-		return nil, err
 	}
-
-	var index WorkingSetIndex
-	if err := json.Unmarshal(buf, &index); err != nil {
-		return nil, err
-	}
-	return &index, nil
+	return output
 }
 
-func writeWorkingSetFile(filename string, data []byte) error {
-	path, err := filePath(filename)
-	if err != nil {
-		return err
+func getConfigValue(configName string, config map[string]any) any {
+	if config == nil {
+		return nil
 	}
 
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	key, rest, foundSep := strings.Cut(configName, ".")
+	if !foundSep {
+		return config[key]
+	}
 
-	return os.WriteFile(path, data, 0o644)
+	childConfig, ok := config[key].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	return getConfigValue(rest, childConfig)
 }
 
-func readWorkingSetFile(filename string) ([]byte, error) {
-	path, err := filePath(filename)
-	if err != nil {
-		return nil, err
+func mergeValueIntoMap(output map[string]any, path string, value any) {
+	key, rest, foundSep := strings.Cut(path, ".")
+	if !foundSep {
+		output[key] = value
+		return
 	}
-	buf, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+
+	_, found := output[key]
+	if !found {
+		output[key] = make(map[string]any)
 	}
-	return buf, nil
+
+	childConfig, ok := output[key].(map[string]any)
+	if !ok {
+		return
+	}
+
+	mergeValueIntoMap(childConfig, rest, value)
 }
 
-func filePath(filename string) (string, error) {
-	if filepath.IsAbs(filename) {
-		return filename, nil
+func deleteValueFromMap(output map[string]any, path string) bool {
+	key, rest, foundSep := strings.Cut(path, ".")
+	if !foundSep {
+		_, found := output[key]
+		delete(output, key)
+		return found
 	}
-	if strings.HasPrefix(filename, "./") {
-		return filepath.Abs(filename)
+
+	childConfig, ok := output[key].(map[string]any)
+	if !ok {
+		return false
 	}
-	homeDir, err := user.HomeDir()
-	if err != nil {
-		return "", err
+
+	deleted := deleteValueFromMap(childConfig, rest)
+	if deleted && len(childConfig) == 0 {
+		// If child config is now empty, delete the whole object
+		delete(output, key)
 	}
-	return filepath.Join(homeDir, ".docker", "mcp", "workingset", filename), nil
+	return deleted
 }
